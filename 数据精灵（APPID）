@@ -1,0 +1,1125 @@
+import os
+import base64
+import sys
+import time
+import random
+import requests
+from openpyxl import Workbook
+from datetime import datetime, timedelta
+from PyQt5.QtGui import QFont, QPixmap, QIcon, QColor
+from PyQt5.QtCore import QThreadPool, QDateTime, QByteArray, Qt, QSize, QTimer, QThread
+from configparser import ConfigParser
+from PyQt5.QtWidgets import QApplication, QMessageBox, QFileDialog, QDateTimeEdit, QLabel, QSizePolicy, \
+    QListWidget, QStackedWidget, QProgressBar, QGroupBox, QGridLayout, QListWidgetItem, QFrame
+from PyQt5.QtCore import QRunnable, pyqtSignal, QObject, QStandardPaths
+from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton
+from openpyxl.reader.excel import load_workbook
+from collections import deque
+
+
+class WorkerSignals(QObject):  # 定义信号类，用于线程间通信
+    finished = pyqtSignal(str)
+
+
+class DataWorker(QRunnable):  # 数据处理线程（APPID -> 游戏ID列表 -> 区间汇总）
+    def __init__(self, user_id, signals, port, token, code, start_time, end_time):
+        super().__init__()
+        self.user_id = user_id          # 传入的是 APPID
+        self.signals = signals
+        self.port = port
+        self.code = code
+        self.token = token
+        self.start_time = start_time    # 秒级时间戳
+        self.end_time = end_time        # 秒级时间戳
+
+    def run(self):
+        session = requests.Session()
+        headers = {"Cookie": f"token={self.token}"}
+        base = f"http://xingfu.boinht.com:{self.port}"
+
+        # ---- 工具函数 ----
+        RETRY_STATUS = {429, 500, 502, 503, 504, 403}
+
+        def safe_ts(ts):
+            try:
+                ts = int(ts)
+                if ts > 0:
+                    return datetime.fromtimestamp(ts)
+            except Exception:
+                pass
+            return ""
+
+        def make_request(url, data, max_retries=4, timeout=10):
+            """
+            轻量重试策略（更快恢复）：
+            - 429: 等 ~0.85s 再试（接口限流 0.8s/次，给点余量）
+            - 403: 等 ~1.0s 再试
+            - 5xx/网络异常: 0.25s 快速复试 + 轻量指数退避（0.4, 0.8, 1.2）
+            - 空 result: 0.25s 快速复试一次
+            """
+            last_exception = None
+            empty_retry_used = False
+
+            for attempt in range(1, max_retries + 1):
+                try:
+                    resp = session.post(url, data=data, headers=headers, timeout=timeout)
+
+                    if not resp.ok:
+                        code = resp.status_code
+                        if code in RETRY_STATUS:
+                            # 针对限流/权限做短等待，再进入下一轮
+                            if code == 429:
+                                time.sleep(0.85 + random.uniform(0.0, 0.05))
+                            elif code == 403:
+                                time.sleep(1.0 + random.uniform(0.0, 0.1))
+                            else:
+                                # 5xx：轻量退避
+                                base_delay = 0.4
+                                delay = base_delay * (attempt - 1)
+                                time.sleep(delay if delay > 0 else 0.25)
+                            continue
+                        else:
+                            # 其他 4xx 不重试
+                            return []
+
+                    try:
+                        j = resp.json()
+                    except Exception as je:
+                        last_exception = je
+                        # 解析异常做一次快速复试
+                        time.sleep(0.25)
+                        continue
+
+                    biz_code = j.get("code", 0)
+                    if biz_code != 0:
+                        # 业务错误：轻量退避
+                        base_delay = 0.4
+                        delay = base_delay * (attempt - 1)
+                        time.sleep(delay if delay > 0 else 0.25)
+                        continue
+
+                    result = j.get("result", [])
+                    if result:
+                        return result
+
+                    # 空结果：仅一次快速复试
+                    if not empty_retry_used:
+                        empty_retry_used = True
+                        time.sleep(0.25)
+                        continue
+                    return []
+
+                except Exception as e:
+                    last_exception = e
+                    # 网络异常：轻量退避
+                    base_delay = 0.4
+                    delay = base_delay * (attempt - 1)
+                    time.sleep(delay if delay > 0 else 0.25)
+
+            if last_exception:
+                print(f"[请求失败] {url} -> {last_exception}")
+            return []
+
+        # ---- 每账号只做一次小延迟 (1~1.3s) ----
+        # time.sleep(random.uniform(1.0, 1.3))
+
+        # ---- 业务逻辑 ----
+        # 1) APPID -> 用户画像（含渠道/IP）
+        url1 = f"{base}/user/pf_list_with_game"
+        data1 = {
+            "channel_id": "",
+            "id": self.user_id,   # 用 APPID 查询
+            "page_size": 32,
+            "page": 1,
+            "login_code": self.code,
+        }
+        data11 = make_request(url1, data1)
+
+        # 预置输出字段（为避免导出错列，尽量填满）
+        game_id_for_output = "无数据"
+        有效投注 = 0
+        提充客损 = 0
+        充值 = 0
+        提现 = 0
+        游戏损益 = 0
+        app_user_id = self.user_id  # APPID 放到 index 11
+        注册 = 注册ip地区 = 最后登录 = 最后登录ip地区 = ""
+        注册时间 = ""
+        最后登录时间 = ""
+        总充值 = 0
+        总提现 = 0
+        余额 = 0
+        商户 = 渠道 = "无"
+
+        if not data11:
+            其他信息 = f'总充值：{总充值} / 总提现：{总提现} / 打赏："0" / 钻石："0" / 余额：{余额}'
+            渠道信息 = f'{商户} / {渠道}'
+            注册IP = f'{注册} / {注册ip地区}'
+            最后登录ip = f'{最后登录} / {最后登录ip地区}'
+            output = (
+                f"{game_id_for_output}, {有效投注}, {其他信息}, {注册IP}, {最后登录ip}, "
+                f"{注册时间}, {最后登录时间}, {提充客损}, {充值}, {提现}, {游戏损益}, {app_user_id}, {渠道信息}"
+            )
+            print(output)
+            self.signals.finished.emit(output)
+            return
+
+        # 正常情况：按 APPID 一般只返回一个对象，这里取第一个为准
+        aa = data11[0]
+        app_user_id = aa.get("id", app_user_id)
+        注册 = aa.get("reg_ip", "") or ""
+        注册ip地区 = aa.get("reg_ip_adress", "") or ""
+        最后登录 = aa.get("last_ip", "") or ""
+        最后登录ip地区 = aa.get("pre_ip_adress", "") or ""
+        商户 = aa.get("channel_id")
+        渠道 = aa.get("open_channel_id")
+        打赏 = aa.get("use_diamond", 0) or 0
+        钻石 = aa.get("diamond", 0) or 0
+
+        # 2) APPID -> 游戏列表（取第一个游戏ID为主）
+        url2 = f"{base}/user/get_user_game_data_by_app_userid"
+        data2 = {"user_id": app_user_id, "login_code": self.code}
+        data22 = make_request(url2, data2)
+
+        if data22:
+            # 资金信息（按你原逻辑：取“最后一个 bb”的值）
+            for bb in data22:
+                总充值 = bb.get("total_recharge", 0) or 0
+                总提现 = bb.get("total_cash", 0) or 0
+                余额 = bb.get("money", 0) or 0
+                注册时间 = safe_ts(bb.get("create_time", 0))
+                最后登录时间 = safe_ts(bb.get("last_login", 0))
+
+            游戏id列表 = [bb.get("id") for bb in data22 if bb.get("id")]
+            if 游戏id列表:
+                game_id_for_output = 游戏id列表[0]
+
+                # 3) 选定的游戏ID -> 区间汇总
+                url3 = f"{base}/pp_user/recent_overview_by_userid"
+                data3 = {
+                    "user_id": game_id_for_output,
+                    "start_time": self.start_time,
+                    "end_time": self.end_time,
+                    "login_code": self.code,
+                }
+                data33 = make_request(url3, data3)
+                if data33:
+                    cc = data33[0]
+                    有效投注 = cc.get("vaild_bet") or 0
+                    游戏损益 = cc.get("delta_bet_win") or 0
+                    充值 = cc.get("recharge", 0) or 0
+                    提充客损 = cc.get("delta_recharge_cash", 0) or 0
+                    提现 = cc.get("cash") or 0
+
+        其他信息 = f'总充值：{总充值} / 总提现：{总提现} / 打赏："{打赏}" / 钻石："{钻石}" / 余额：{余额}'
+        渠道信息 = f'{商户} / {渠道}'
+        注册IP = f'{注册} / {注册ip地区}'
+        最后登录ip = f'{最后登录} / {最后登录ip地区}'
+
+        # —— 最终输出（列顺序与 export_data 完全匹配）——
+        output = (
+            f"{game_id_for_output}, {有效投注}, {其他信息}, {注册IP}, {最后登录ip}, "
+            f"{注册时间}, {最后登录时间}, {提充客损}, {充值}, {提现}, {游戏损益}, {app_user_id}, {渠道信息}"
+        )
+
+        print(output)
+        self.signals.finished.emit(output)
+
+
+# ===== 新增：CookieWorker（一个 Cookie 一个线程，完成+1s 限速）=====
+class CookieWorker(QThread):
+    def __init__(self, owner, group, token, queue_deque, port, code, start_ts, end_ts):
+        super().__init__()
+        self.owner = owner
+        self.group = group
+        self.token = token
+        self.queue = queue_deque  # 预分片后的独立队列（无锁）
+        self.port = port
+        self.code = code
+        self.start_ts = start_ts
+        self.end_ts = end_ts
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        last_finish = 0.0
+        while not self._stop:
+            # 全局暂停：粗粒度休眠等待恢复
+            if getattr(self.owner, "paused", False):
+                time.sleep(0.15)
+                continue
+
+            if not self.queue:
+                break  # 本线程任务耗尽
+
+            user_id = self.queue.popleft()
+
+            # 与主线程的回调信号
+            signals = WorkerSignals()
+            signals.finished.connect(self.owner.task_finished, Qt.QueuedConnection)
+
+            # 执行单个账号任务，异常兜底
+            start_one = time.time()
+            try:
+                worker = DataWorker(user_id, signals, self.port, self.token, self.code,
+                                    self.start_ts, self.end_ts)
+                worker.run()  # DataWorker 内部应在完成时 signals.finished.emit(result)
+            except Exception as e:
+                # 兜底把错误也回传，避免线程直接崩掉
+                try:
+                    err = {"user_id": user_id, "ok": False, "error": str(e)}
+                    signals.finished.emit(err)
+                except Exception:
+                    pass
+            finally:
+                last_finish = time.time()
+
+            # 完成 + 1s 限速（含请求耗时），更稳妥
+            elapsed = last_finish - start_one
+            if elapsed < 1.0:
+                # 若全局已暂停/停止，快速响应；否则补足到 1 秒
+                remain = 1.0 - elapsed
+                slept = 0.0
+                step = 0.05
+                while slept < remain and not self._stop and not getattr(self.owner, "paused", False):
+                    time.sleep(min(step, remain - slept))
+                    slept += step
+
+        # 线程自然结束，交由主线程统计 done
+        # 不需要显式发 finished 结果，这里的线程 finished 用 QThread.finished 信号
+
+
+class UserWindow(QWidget):  # 主窗口类
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("数据精灵")
+        self.resize(1200, 800)  # 初始大小
+
+        # 🌐 联网验证 + 时间验证
+        self.check_network_validation()
+
+        # 加载 base64 图标（确保字符串完整）
+        icon_base64 = "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//8iV///Ilf//yJX//8iV///Ilf//yJW//IiV/+HGFX/FQAAAAAAAAAAAAAAACFV/ychV//OIlf/5AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIVj/PSFW/88iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV//2Ilf/ryJX/5AiV/+1Ilf/+iJX//8iV//aAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJEn/ByFW/5IiVv/+Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/6UAAAAAAAAAAAAAAAAAAAAAAAAAACBV/xghVv/JIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/TAAAAAAAAAAAAAAAAAAAAAAhWv8fIVf/3SJX//8iV///Ilf//yJX/+giVv+9IVf/oSJX/5YiV/+cIlb/tCJX/98iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yFX/84AAP8BAAAAAAAAAAAAAAAAIVn/FyJX/9wiV///Ilb/ySJV/28jVf8kAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFS/x8hV/91Ilf/4CJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8hV//8IFf/OAAAAAAAAAAAAAAAACpV/wYiV//FIlf/rSJY/zQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACpV/wYgVv+OIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW/4gAAAAAAAAAAAAAAAAAAAAAIVf/VSBT/zcAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAhWf8XIlf/xSJX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AAAAAAAAIlb/dyJX//8hVv/PG1H/EwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIGD/CABV/wMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABxV/wkhV//lIVf/wh5a/xEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIVj/eiJX/5wkSf8HAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFZ/xciVv9TAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKAAAADAAAABgAAAAAQAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/AUBA/wQqVf8GJEn/BzNm/wUAAP8BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/wEgUP8QHlX/MyJW/1MhWP9rIlf/fiNW/4whV/+SIVb/lCJX/40iVv9/I1f/ZiJW/0QgVf8YAAD/AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFT/y4hWf8XAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAaTf8KIlf/TCFY/6AjV//VIVf/5SJX//AiV//4Ilf//iJX//8iV///Ilf//yJX//8iVv/+Ilf/9yJX/+siV//YIlf/liNX/ywAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJFv/KiJX/9AjV/9JAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAcVf8JHVf/IyFW/3whV//fIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW//ghVv+gIVf/Lxdd/wsAAAAAAAAAAAAAAAAAAAAAAAAAACpV/wYkWP9AIVj/3SJX//UhWP9jAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACNU/zoiVv+UIlf/5CJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/6iJX/54gWP9XIlP/JSBg/xAcVf8bI1X/QiFX/4oiV//iIlf//yJX//YhVv9lAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAbXv8TIlf/kCJX/+giV//8Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//4iV//xIlf/4SJX/9ohV//dIlf/6iJX//wiV///Ilf//yJX//EhV/9VAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQED/BCBY/zciV//IIlf//iJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yNX/+UkV/8yAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgUP8QIVb/cyJX/+ciV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW/8MaTf8KAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACdi/w0iV/+VIlf/9iJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/2EAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHFX/EiNW/6EiV///Ilf//yJX//8iV///Ilf//yJX//oiV//vIlf/5yJX/+EhV//dIlf/3CNX/90iV//hIlf/6CJX//EiV//8Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/0kBA/wQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAjWP8dIVf/qCJX//8iV///Ilf//yJX//YhV//HIVf/mSJY/3EfWP9RIFj/NyJT/yUdWP8aIVn/FydY/xoiV/8mI1j/OiNY/1chVv98Ilf/qiJX/+EiV//+Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iVv/vIlf/TAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACdO/w0hWP+aIlf/+yJX//8iV//nIVb/iyRX/zIgVf8YHFX/CQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgP8CJFv/DiJa/yUhVv9zIlf/6CJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//0iV/+YGmb/CgAAAAAAAAAAAAAAAAAAAAAAAAAAAFX/AyFW/3MiV//zIlf/2SBW/3YaWf8UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/wEcVf8SIlf/gSJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/9giU/8lAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIFf/WCJW/8MgV/9vHVj/GgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACJb/y0iV/+tIlf/+SJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/74AQP8EAAAAAAAAAAAAAAAAAAAAAAAAAAAgWP8gIlb/WR1Y/xoAVf8DAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIFT/QCFX/94iV//9Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/+AiWv8lAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP8BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBA/wQiVv9TIlj/6yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yFX/+0iVv9KAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACJX/2EiV//iIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//YhWP9jAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP8BI1f/bCJX//EiV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//shVv90AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBA/wQhWP9jIlf/8SJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//0hV/97AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA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AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFX/1UiVv/PIFn/PwBA/wQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHFX/EiJX/58hVf8nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIlP/JSJV/w8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="  # 替换成你的 base64
+        icon_data = QByteArray.fromBase64(icon_base64.encode())
+
+        # 更可靠的图标加载方式
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(icon_data, "ICO"):  # 显式指定格式
+            print("❌ 图标加载失败！请检查 base64 数据或文件格式")
+        else:
+            self.setWindowIcon(QIcon(pixmap))  # 设置窗口和任务栏图标
+
+        self.groups = self.load_group_names_from_config()
+        self.token_inputs = {}
+
+        self.completed_tasks = []  # 初始化已完成任务列表
+
+        # 设置主窗口样式
+        self.setStyleSheet("""
+            QPushButton {
+                background-color: white;            /* 白色背景 */
+                color: #3498db;                     /* 蓝色文字 */
+                border: 1px solid #3498db;          /* 蓝色边框 */
+                border-radius: 8px;                 /* 圆角半径8px */
+                padding: 10px 16px;                 /* 内边距 */
+                font-size: 16px;                    /* 字体大小 */
+                font-weight: bold;                 /* 字体加粗 */
+                letter-spacing: 0.5px;              /* 字符间距 */
+            }
+
+            QPushButton:hover {
+                background-color: #ecf5fb;          /* 鼠标悬停时浅蓝背景（视觉反馈） */
+                color: #2980b9;                     /* 悬停时文字颜色稍微加深 */
+                border: 1px solid #2980b9;          /* 边框颜色也稍微加深 */
+            }
+
+            QPushButton:pressed {
+                background-color: #d6eaf8;          /* 按下时更深一点的浅蓝背景 */
+                padding-left: 14px;                 /* 模拟按压感 */
+                padding-top: 12px;
+            }
+
+            QPushButton:disabled {
+                background-color: #f0f0f0;          /* 禁用时背景灰色 */
+                color: #bdc3c7;                     /* 禁用时字体浅灰 */
+                border: 1px solid #ccc;             /* 边框变浅灰 */
+            }
+
+            QLineEdit, QComboBox, QDateTimeEdit {
+                padding: 6px;                      /* 输入控件内边距（6px） */
+                border: 1px solid #ccc;            /* 边框颜色为浅灰色 */
+                border-radius: 5px;                /* 圆角（5px） */
+                font-size: 20px;                   /* 字体大小（20px） */
+            }
+
+            QGroupBox {
+                border: 1px solid #aaa;  /* 组框边框颜色和宽度 */
+                border-radius: 8px;  /* 组框圆角 */
+                margin-top: 6px;  /* 组框顶部外边距 */
+            }
+
+            QGroupBox::title {
+                subcontrol-origin: margin;  /* 组框标题基于边距定位 */
+                subcontrol-position: top center;  /* 组框标题居中 */
+                padding: 0 6px;  /* 组框标题内边距 */
+                font-size: 15px;  /* 组框标题字体大小 */
+                font-weight: bold;  /* 组框标题加粗 */
+            }
+        """)
+
+        main_layout = QVBoxLayout(self)  # 设置主布局为垂直布局
+
+        # 内容区域：导航栏 + 页面
+        content_layout = QHBoxLayout()  # 水平布局容纳导航栏和页面
+
+        # 左侧导航栏
+        self.nav_list = QListWidget()
+        self.nav_list.setFixedWidth(200)  # 设置固定宽度
+        self.nav_list.setFont(QFont("Microsoft YaHei", 11))  # 设置字体和大小
+
+        # 设置导航栏样式
+        self.nav_list.setStyleSheet("""
+                    QListWidget {
+                        background-color: #2c3e50;  /* 列表控件背景颜色（深蓝色） */
+                        color: #ecf0f1;            /* 列表默认文字颜色（浅灰色） */
+                        border: none;              /* 无边框 */
+                        padding-top: 15px;        /* 顶部内边距（15px） */
+                        outline: none;            /* 移除焦点时的虚线边框 */
+                    }
+                    QListWidget::item {
+                        padding: 12px 20px;       /* 列表项内边距（上下12px，左右20px） */
+                        margin: 6px 10px;         /* 列表项外边距（上下6px，左右10px） */
+                        font-weight: normal;      /* 正常字体粗细 */
+                        border-radius: 6px;       /* 列表项圆角半径（6px） */
+                    }
+                    QListWidget::item:hover {
+                        background-color: #3d566e;  /* 鼠标悬停时背景颜色（稍亮的蓝色） */
+                        font-weight: bold;         /* 悬停时字体加粗 */
+                        color: #ffffff;            /* 悬停时文字颜色（纯白） */
+                    }
+                    QListWidget::item:selected {
+                        background-color: #1abc9c;  /* 选中项背景颜色（蓝绿色） */
+                        color: #ffffff;            /* 选中项文字颜色（纯白） */
+                        font-weight: bold;         /* 选中项字体加粗 */
+                    }
+                """)
+
+        item1 = QListWidgetItem("📊 数据采集")
+        item2 = QListWidgetItem("⚙️ 参数配置")
+        item3 = QListWidgetItem("📘 关于")
+
+        item1.setSizeHint(QSize(item1.sizeHint().width(), 40))
+        item2.setSizeHint(QSize(item2.sizeHint().width(), 40))
+        item3.setSizeHint(QSize(item3.sizeHint().width(), 40))
+
+        self.nav_list.addItem(item1)
+        self.nav_list.addItem(item2)
+        self.nav_list.addItem(item3)
+
+        self.nav_list.setCurrentRow(0)
+        self.nav_list.currentRowChanged.connect(self.switch_page)
+
+        # 右侧页面栈
+        self.pages = QStackedWidget()
+        self.data_tab = QWidget()
+        self.config_tab = QWidget()
+        self.about_tab = QWidget()
+        self.pages.addWidget(self.data_tab)
+        self.pages.addWidget(self.config_tab)
+        self.pages.addWidget(self.about_tab)
+
+        content_layout.addWidget(self.nav_list)
+        content_layout.addWidget(self.pages)
+        main_layout.addLayout(content_layout)
+
+        # 状态栏与进度条
+        self.status_label = QLabel("状态：等待中")
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        main_layout.addWidget(self.status_label)
+        main_layout.addWidget(self.progress_bar)
+
+        # 页面设置
+        self.setup_data_tab()
+        self.setup_config_tab()
+        self.setup_about_tab()
+
+        self.load_config()
+        self.set_default_dates_for(self.start_time_input, self.end_time_input)
+
+    def check_network_validation(self):
+        try:
+            program_id = "appid_dashujuhebing"  # 每个程序用自己的名字（必须和JSON文件里的 key 对应）
+            response = requests.get("http://8.210.92.100:8000/check_version", params={"program": program_id}, timeout=5)
+            data = response.json()
+
+            status = data.get("status")
+
+            if status != "active":
+                QMessageBox.critical(self, "兼容性错误", "系统组件加载失败（Code: S-1）")
+                sys.exit(0)
+
+        except Exception:
+            QMessageBox.critical(self, "兼容性错误", "组件连接失败，请稍后重试（Code: S-2）")
+            sys.exit(0)
+
+    def switch_page(self, index):
+        self.pages.setCurrentIndex(index)
+
+    def setup_data_tab(self):  # 数据获取页面
+        layout = QVBoxLayout()
+
+        # 文件选择区域（已移除线程数和小组选择）
+        file_group = QGroupBox("您好，欢迎使用数据精灵！")
+        file_layout = QVBoxLayout()
+
+        self.file_button = QPushButton("📁 选择文件")
+        self.file_button.clicked.connect(self.select_file)
+        file_layout.addWidget(self.file_button)
+
+        file_group.setLayout(file_layout)
+        layout.addWidget(file_group)
+
+        # 日期范围
+        date_group = QGroupBox("日期范围选择")
+        date_layout = QVBoxLayout()
+
+        def disable_mouse_click_adjust(edit: QDateTimeEdit):
+            def blocked_mousePressEvent(event):
+                if event.button() == Qt.LeftButton:
+                    event.ignore()
+                else:
+                    QDateTimeEdit.mousePressEvent(edit, event)
+
+            edit.mousePressEvent = blocked_mousePressEvent
+
+        # 开始时间
+        self.start_time_input = QDateTimeEdit()
+        self.start_time_input.setCalendarPopup(True)
+        self.start_time_input.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
+        self.start_time_input.wheelEvent = lambda event: event.ignore()
+        disable_mouse_click_adjust(self.start_time_input)
+
+        # 结束时间
+        self.end_time_input = QDateTimeEdit()
+        self.end_time_input.setCalendarPopup(True)
+        self.end_time_input.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
+        self.end_time_input.wheelEvent = lambda event: event.ignore()
+        disable_mouse_click_adjust(self.end_time_input)
+
+        date_layout.addWidget(QLabel("开始时间："))
+        date_layout.addWidget(self.start_time_input)
+        date_layout.addWidget(QLabel("结束时间："))
+        date_layout.addWidget(self.end_time_input)
+
+        nav_layout = QHBoxLayout()
+
+        self.prev_day_btn = QPushButton("⏪ 上一日")
+        self.prev_day_btn.clicked.connect(self.on_prev_day_clicked)
+        nav_layout.addWidget(self.prev_day_btn)
+
+        self.today_btn = QPushButton("⏺️ 当日")
+        self.today_btn.clicked.connect(self.on_today_clicked)
+        nav_layout.addWidget(self.today_btn)
+
+        self.next_day_btn = QPushButton("下一日 ⏩")
+        self.next_day_btn.clicked.connect(self.on_next_day_clicked)
+        nav_layout.addWidget(self.next_day_btn)
+
+        date_layout.addLayout(nav_layout)
+        date_group.setLayout(date_layout)
+        layout.addWidget(date_group)
+
+        # 操作按钮水平布局
+        button_layout = QHBoxLayout()
+
+        self.get_button = QPushButton("🚀 开始采集")
+        self.get_button.clicked.connect(self.start_processing)
+        button_layout.addWidget(self.get_button)
+
+        self.export_button = QPushButton("📤 导出数据")
+        self.export_button.clicked.connect(self.export_data)
+        button_layout.addWidget(self.export_button)
+
+        layout.addSpacing(16)
+        layout.addLayout(button_layout)
+
+        self.data_tab.setLayout(layout)
+
+        # 初始样式设置
+        self.highlight_selected_check_bu(self.today_btn)
+
+    def highlight_selected_check_bu(self, selected_button):
+        buttons = [
+            self.prev_day_btn,
+            self.today_btn,
+            self.next_day_btn,
+        ]
+        for btn in buttons:
+            if btn == selected_button:
+                btn.setStyleSheet("""
+                            QPushButton {
+                                background-color: #1DA1F2;
+                                color: white;
+                                border-radius: 6px;
+                                padding: 8px 14px;
+                                font-weight: bold;
+                            }
+                            QPushButton:hover {
+                                background-color: #0d8ddf;
+                            }
+                        """)
+            else:
+                btn.setStyleSheet("""
+                            QPushButton {
+                                background-color: white;
+                                color: #3498db;
+                                border: 1px solid #3498db;
+                                border-radius: 6px;
+                                padding: 8px 14px;
+                                font-weight: bold;
+                            }
+                            QPushButton:hover {
+                                background-color: #ecf5fb;
+                                color: #2980b9;
+                                border: 1px solid #2980b9;
+                            }
+                        """)
+
+    def on_today_clicked(self):  # 当日按钮点击事件
+        self.set_default_dates_for(self.start_time_input, self.end_time_input)  # 设置默认日期为今天
+        self.highlight_selected_check_bu(self.today_btn)  # 高亮选中按钮
+
+    def on_prev_day_clicked(self):  # 上一日按钮点击事件
+        self.move_to_previous_day_for(self.start_time_input, self.end_time_input)  # 移动到前一天
+        self.highlight_selected_check_bu(self.prev_day_btn)  # 高亮选中按钮
+
+    def on_next_day_clicked(self):  # 下一日按钮点击事件
+        self.move_to_next_day_for(self.start_time_input, self.end_time_input)  # 移动到后一天
+        self.highlight_selected_check_bu(self.next_day_btn)  # 高亮选中按钮
+
+    def setup_config_tab(self):  # 配置页面
+        layout = QVBoxLayout()
+
+        config_group = QGroupBox("分组 Cookie 参数")
+        grid = QGridLayout()
+
+        max_rows_per_column = 8  # 每列最多8行
+        for i, group in enumerate(self.groups):
+            row = i % max_rows_per_column
+            col = (i // max_rows_per_column) * 2  # 每组占2列：label + input
+
+            label = QLabel(f"{group} ：")
+            line_edit = QLineEdit()
+            line_edit.setPlaceholderText(f"请输入Cookie（多个用英文逗号分隔）")
+            line_edit.setToolTip("支持多个 Cookie，使用英文逗号分隔，例如：ck1,ck2,ck3")
+            self.token_inputs[group] = line_edit
+
+            grid.addWidget(label, row, col)
+            grid.addWidget(line_edit, row, col + 1)
+
+        config_group.setLayout(grid)
+        layout.addWidget(config_group)
+
+        # 端口配置
+        port_group = QGroupBox("基础参数 (通用)")
+        port_layout = QVBoxLayout()
+
+        port_row = QHBoxLayout()
+        port_label = QLabel("🌐 端口号：")
+        self.port_input = QLineEdit()
+        self.port_input.setPlaceholderText("请输入端口号，例如：8080")
+        port_row.addWidget(port_label)
+        port_row.addWidget(self.port_input)
+        port_layout.addLayout(port_row)
+
+        code_row = QHBoxLayout()
+        code_label = QLabel("🔢 登录码：")
+        self.code_input = QLineEdit()
+        self.code_input.setPlaceholderText("请输入小明计算器登陆码")
+        code_row.addWidget(code_label)
+        code_row.addWidget(self.code_input)
+        port_layout.addLayout(code_row)
+
+        port_group.setLayout(port_layout)
+        layout.addWidget(port_group)
+
+        self.save_button = QPushButton("💾 保存配置")
+        self.save_button.clicked.connect(self.manual_save)
+        layout.addSpacing(16)
+        layout.addWidget(self.save_button)
+
+        self.config_tab.setLayout(layout)
+
+    def setup_about_tab(self):  # 关于我们页面（白色声明框填充到底）
+        layout = QVBoxLayout()
+        layout.setContentsMargins(12, 12, 16, 16)
+        layout.setSpacing(0)
+
+        content = QWidget()
+        col = QVBoxLayout(content)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(0)
+
+        version = getattr(self, "app_version", "v1.0.0")
+        update_date = getattr(self, "app_update_date", "2025-08-24")
+
+        # 标题
+        title = QLabel("关于数据精灵（APPID版）")
+        title.setStyleSheet("font-size:25px; font-weight:700; color:#1f2937;")
+        col.addWidget(title, 0, Qt.AlignLeft)
+        col.addSpacing(15)
+
+        # 版本行（字号加大）
+        ver_row = QHBoxLayout()
+        ver_row.setSpacing(8)
+
+        ver_label = QLabel("版本：")
+        ver_label.setStyleSheet("font-size:16px;")  # ← 加大
+
+        ver_value = QLabel(version)
+        ver_value.setStyleSheet("font-size:16px; color:#0f766e; font-weight:600;")  # ← 加大
+
+        date_label = QLabel(f"  更新日期：{update_date}")
+        date_label.setStyleSheet("font-size:16px; color:#64748b;")  # ← 加大
+
+        ver_row.addWidget(ver_label, 0, Qt.AlignLeft)
+        ver_row.addWidget(ver_value, 0, Qt.AlignLeft)
+        ver_row.addWidget(date_label, 0, Qt.AlignLeft)
+        ver_row.addStretch(1)
+        col.addLayout(ver_row)
+        col.addSpacing(35)
+
+        # “声明：” 标题
+        decl_title = QLabel("声明：")
+        decl_title.setStyleSheet("font-size:14px; font-weight:700; color:#111827;")
+        col.addWidget(decl_title, 0, Qt.AlignLeft)
+        col.addSpacing(12)
+
+        # 白色框
+        box = QFrame()
+        box.setStyleSheet("""
+            QFrame {
+                background: #ffffff;
+                border-radius: 8px;
+            }
+        """)
+        box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        box_layout = QVBoxLayout(box)
+        box_layout.setContentsMargins(14, 12, 14, 12)
+        box_layout.setSpacing(6)
+
+        # 声明正文（最后一句加粗）
+        body = QLabel(
+            "<div style='color:#374151; font-size:15px; line-height:1.9;'>"
+            "《数据精灵》（原名《APPID获取大数据》),本软件仅供具备后台访问权限且已获授权的用户在合规前提下使用,主要用于采集平台相关账号大数据。"
+            "使用者应确认/保证数据与账号来源合规、授权充分，并对自身操作及结果承担全部责任。<br/><br/>"
+            "因授权不足或违规使用导致的任何损失、处罚等由使用者自行承担。本软件按“现状”提供，不作任何明示或默示担保；"
+            "作者对因使用或无法使用本软件造成的任何直接或间接损失不承担责任。本软件与相关平台/商户/支付机构无隶属或合作关系。<br/><br/>"
+            "<b>继续使用即表示您已阅读、理解并同意本声明。</b>"
+            "</div>"
+        )
+        body.setWordWrap(True)
+        body.setTextFormat(Qt.RichText)
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setMargin(0)
+        box_layout.addWidget(body, 0, Qt.AlignTop)
+        box_layout.addStretch(1)
+
+        col.addWidget(box, 1)
+
+        layout.addWidget(content, 1)
+        self.about_tab.setLayout(layout)
+
+    def set_default_dates_for(self, start_input, end_input):  # 设置默认今天和明天
+        current_date = datetime.now().date()
+        tomorrow = current_date + timedelta(days=1)
+        start_input.setDateTime(QDateTime(current_date.year, current_date.month, current_date.day, 0, 0))
+        end_input.setDateTime(QDateTime(tomorrow.year, tomorrow.month, tomorrow.day, 0, 0))
+
+    def move_to_previous_day_for(self, start_input, end_input):  # 移动到前一天
+        date = start_input.dateTime().addDays(-1)
+        start_input.setDateTime(date)
+        end_input.setDateTime(date.addDays(1))
+
+    def move_to_next_day_for(self, start_input, end_input):  # 移动到后一天
+        date = start_input.dateTime().addDays(1)
+        start_input.setDateTime(date)
+        end_input.setDateTime(date.addDays(1))
+
+    def select_file(self):  # 选择用户ID文件（Excel）
+        desktop_path = QStandardPaths.writableLocation(QStandardPaths.DesktopLocation)
+        file_name, _ = QFileDialog.getOpenFileName(
+            self, "选择用户ID Excel文件", desktop_path,
+            "Excel Files (*.xlsx);;All Files (*)"
+        )
+
+        if file_name:
+            self.user_ids = []  # 清空旧数据
+            error_rows = []
+
+            try:
+                wb = load_workbook(filename=file_name, data_only=True)
+                ws = wb.active
+
+                headers = {cell.value: idx for idx, cell in enumerate(next(ws.iter_rows(min_row=1, max_row=1)))}
+                if 'GameId' not in headers or 'Source' not in headers:
+                    QMessageBox.warning(self, "错误", "Excel文件缺少必要的表头：'GameId' 或 'Source'")
+                    return
+
+                for row_idx, row in enumerate(ws.iter_rows(min_row=2), start=2):
+                    user_id = str(row[headers['GameId']].value).strip()
+                    group = str(row[headers['Source']].value).strip()
+
+                    if group and user_id.isdigit():
+                        self.user_ids.append({"group": group, "user_id": user_id})
+                    else:
+                        error_rows.append(row_idx)
+
+                if error_rows:
+                    msg = f"部分行格式有误（非数字ID或小组为空），错误行号：{', '.join(map(str, error_rows))}"
+                    QMessageBox.warning(self, "错误", msg)
+                else:
+                    QMessageBox.information(self, "导入成功", f"成功导入 {len(self.user_ids)} 个用户账号！")
+                    self.get_button.setEnabled(True)
+
+            except Exception as e:
+                QMessageBox.warning(self, "错误", f"读取Excel出错：{str(e)}")
+
+    # ===== 替换：start_processing（多 Cookie = 多线程；预分片轮询分配）=====
+    def start_processing(self):
+        if not hasattr(self, 'user_ids') or not self.user_ids:
+            QMessageBox.warning(self, "提示", "请先选择包含用户ID的文件！")
+            return
+
+        self.completed_tasks = []
+        port = self.port_input.text().strip()
+        code = self.code_input.text().strip()
+
+        missing_fields = []
+        if not port:
+            missing_fields.append("端口（port）")
+        if not code:
+            missing_fields.append("验证码（code）")
+
+        # 收集数据中实际出现的小组
+        groups_in_data = []
+        seen_groups = set()
+        for user_info in self.user_ids:
+            g = user_info.get('group')
+            if g not in seen_groups:
+                seen_groups.add(g)
+                groups_in_data.append(g)
+
+        # 解析每个小组的多 Cookie（英文逗号分隔）
+        group_tokens = {}  # dict[group] -> List[token]
+        for group in groups_in_data:
+            token_input = self.token_inputs.get(group)
+            raw = token_input.text().strip() if token_input else ""
+            tokens = [t.strip() for t in raw.split(",") if t.strip()]
+            if not tokens:
+                missing_fields.append(f"小组 {group} 的 Cookie")
+            else:
+                # 去重，保序
+                dedup, _seen = [], set()
+                for t in tokens:
+                    if t not in _seen:
+                        _seen.add(t)
+                        dedup.append(t)
+                group_tokens[group] = dedup
+
+        if missing_fields:
+            QMessageBox.warning(self, "输入错误", "请填写以下内容：\n" + "\n".join(sorted(set(missing_fields))))
+            return
+
+        # 时间校验与转换
+        start = self.start_time_input.dateTime().toString("yyyy-MM-dd HH:mm:ss")
+        end = self.end_time_input.dateTime().toString("yyyy-MM-dd HH:mm:ss")
+        if end < start:
+            QMessageBox.warning(self, '警告', '结束时间不能早于开始时间')
+            return
+
+        self.start_timestamp = int(datetime.strptime(start, '%Y-%m-%d %H:%M:%S').timestamp())
+        self.end_timestamp = int(datetime.strptime(end, '%Y-%m-%d %H:%M:%S').timestamp())
+        self.port = port
+        self.code = code
+
+        # UI 初始化
+        total = len(self.user_ids)
+        self.status_label.setText(f"状态：正在获取数据 (0/{total})")
+        self.progress_bar.setMaximum(total)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
+
+        # 禁用相关按钮
+        self.file_button.setEnabled(False)
+        self.start_time_input.setEnabled(False)
+        self.end_time_input.setEnabled(False)
+        self.get_button.setEnabled(False)
+        self.export_button.setEnabled(False)
+        self.prev_day_btn.setEnabled(False)
+        self.today_btn.setEnabled(False)
+        self.next_day_btn.setEnabled(False)
+
+        # —— 预分片：按组把用户轮询分到各自 Cookie 子队列（无锁） ——
+        # 1) 按组聚合用户
+        group_users = {g: [] for g in group_tokens.keys()}
+        for user_info in self.user_ids:
+            g = user_info.get('group')
+            uid = user_info.get('user_id')
+            if g in group_users:
+                group_users[g].append(uid)
+
+        # 2) 对每组，按照该组 token 数量轮询分配
+        per_cookie_queues = {}  # key: (group, token) -> deque
+        for g, tokens in group_tokens.items():
+            n = len(tokens)
+            if n == 0:
+                continue
+            # 初始化每个 token 对应的队列
+            token_deques = [deque() for _ in range(n)]
+            # 轮询把该组的账号分发到各 token
+            users = group_users.get(g, [])
+            for idx, uid in enumerate(users):
+                token_deques[idx % n].append(uid)
+            # 只为非空队列创建 worker（空的就不启动）
+            for i, tk in enumerate(tokens):
+                dq = token_deques[i]
+                if dq:
+                    per_cookie_queues[(g, tk)] = dq
+
+        # 并发控制字段
+        self.paused = False
+        self.total_done = 0
+
+        # —— 启动：一 Cookie 一个线程 ——
+        self._workers = []
+        self._workers_total = len(per_cookie_queues)
+        self._workers_done = 0
+
+        # 若没有任何任务队列（例如所有组都没有用户），直接收尾
+        if self._workers_total == 0:
+            self.on_scheduler_finished()
+            return
+
+        def _on_worker_thread_finished():
+            # 每个线程自然结束时统计
+            self._workers_done += 1
+            if self._workers_done >= self._workers_total:
+                # 所有线程结束 -> 统一收尾
+                self.on_scheduler_finished()
+
+        for (g, tk), dq in per_cookie_queues.items():
+            w = CookieWorker(
+                owner=self,
+                group=g,
+                token=tk,
+                queue_deque=dq,
+                port=self.port,
+                code=self.code,
+                start_ts=self.start_timestamp,
+                end_ts=self.end_timestamp
+            )
+            w.finished.connect(_on_worker_thread_finished, Qt.QueuedConnection)
+            self._workers.append(w)
+
+        # 可选：这里可以打印一下并发规模
+        # print(f"启动 {len(self._workers)} 个 Cookie 线程，共 {total} 个账号")
+
+        for w in self._workers:
+            w.start()
+
+    # ===== 替换：_resume_after_pause（沿用你的暂停/恢复UI提示）=====
+    def _resume_after_pause(self):
+        """暂停结束后恢复派发（供 QTimer 回调使用）"""
+        self.paused = False
+        # CookieWorker 会在下一轮自动继续；无需手动触发
+
+    # ===== 替换：task_finished（多线程场景下，统计/暂停逻辑保持不变）=====
+    def task_finished(self, result):
+        """单个账号任务完成回调（由 DataWorker.signals.finished 发出）"""
+        self.completed_tasks.append(result)
+
+        # 计数
+        self.total_done += 1
+
+        # 更新进度
+        progress = len(self.completed_tasks)
+        total = len(self.user_ids)
+        self.progress_bar.setValue(progress)
+        self.status_label.setText(f"状态：正在获取数据 ({progress}/{total})")
+
+        # 每 3000 个暂停 5~10 秒（避开 0 次），全局暂停，所有 CookieWorker 感知
+        if (self.total_done > 0) and (self.total_done % 3000 == 0) and not self.paused:
+            pause_seconds = random.randint(5, 10)
+            self.paused = True
+            self.status_label.setText(f"状态：已处理{self.total_done}个，暂停{pause_seconds}秒缓解压力...")
+            QTimer.singleShot(pause_seconds * 1000, self._resume_after_pause)
+
+        # **不在这里收尾**：等所有线程结束（on_scheduler_finished）
+
+    # ===== 替换：调度线程结束时的统一收尾（现在代表“所有 Cookie 线程结束”）=====
+    def on_scheduler_finished(self):
+        """所有 Cookie 线程退出后调用，统一恢复 UI"""
+        total = len(self.user_ids)
+        progress = len(self.completed_tasks)
+
+        # 隐藏进度条 & 提示
+        if progress >= total:
+            self.status_label.setText("状态：所有数据已获取完成！")
+            self.progress_bar.setVisible(False)
+            QMessageBox.information(self, "提示", "所有数据已获取完成！")
+        else:
+            self.status_label.setText(f"状态：任务结束（完成 {progress}/{total}）")
+
+        # 恢复按钮
+        self.file_button.setEnabled(True)
+        self.start_time_input.setEnabled(True)
+        self.end_time_input.setEnabled(True)
+        self.get_button.setEnabled(True)
+        self.export_button.setEnabled(True)
+        self.prev_day_btn.setEnabled(True)
+        self.today_btn.setEnabled(True)
+        self.next_day_btn.setEnabled(True)
+
+    def export_data(self):  # 导出数据到Excel文件
+        if not self.completed_tasks:
+            QMessageBox.warning(self, "警告", "没有数据可导出！")
+            return
+
+        try:
+            wb = Workbook()
+            ws = wb.active
+            ws.append(['APPID', '有效投注', '其他信息', '注册IP', '最后登录IP', '注册时间', '最后登录时间', '提充客损',
+                       '充值', '提现', '游戏损益', '游戏ID', '渠道信息'])  # 更新表头
+
+            for task in self.completed_tasks:
+                parts = task.split(", ")
+                # 使用默认值处理可能缺失的数据
+                游戏id = self.convert_to_number(parts[0]) if len(parts) > 0 else "无数据"
+                有效投注 = self.convert_to_number(parts[1]) if len(parts) > 1 else "无数据"
+                其他信息 = parts[2] if len(parts) > 2 else "无数据"  # 合并的其他信息
+                注册IP = parts[3] if len(parts) > 3 else "无数据"
+                最后登录IP = parts[4] if len(parts) > 4 else "无数据"
+                注册时间 = parts[5] if len(parts) > 5 else "无数据"
+                最后登录时间 = parts[6] if len(parts) > 6 else "无数据"
+                提充客损 = self.convert_to_number(parts[7]) if len(parts) > 7 else "无数据"
+                充值 = self.convert_to_number(parts[8]) if len(parts) > 8 else "无数据"
+                提现 = self.convert_to_number(parts[9]) if len(parts) > 9 else "无数据"
+                游戏损益 = self.convert_to_number(parts[10]) if len(parts) > 10 else "无数据"
+                APPID = self.convert_to_number(parts[11]) if len(parts) > 11 else "无数据"
+                渠道信息 = parts[12] if len(parts) > 12 else "无数据"  # 合并的渠道信息
+
+                # 更新数据行
+                ws.append(
+                    [APPID, 有效投注, 其他信息, 注册IP, 最后登录IP, 注册时间, 最后登录时间, 提充客损,
+                     充值, 提现, 游戏损益, 游戏id, 渠道信息])
+
+            current_time = datetime.now().strftime("%Y年%m月%d日%H时%M分%S秒")
+            filename = f"大数据_{current_time}.xlsx"
+            wb.save(filename)
+            QMessageBox.information(self, "提示", f"大数据已导出到 {filename}")
+            os.startfile(filename)
+
+        except Exception as e:
+            QMessageBox.critical(self, "导出错误", f"导出数据时发生错误: {str(e)}")
+
+    def convert_to_number(self, value):  # 将字符串转换为数字，如果转换失败则返回"无数据"
+        try:
+            return float(value)  # 尝试将值转换为浮点数
+        except ValueError:
+            return "无数据"  # 转换失败时返回"无数据"
+
+    def load_group_names_from_config(self):
+        config = ConfigParser()
+        config.read('config.ini', encoding='utf-8')
+        if 'GROUP_COOKIES' in config:
+            return list(config['GROUP_COOKIES'].keys())
+        # 默认组（首次运行或 config.ini 尚不存在）
+        return ["lvcha", "yaoji", "sejie", "aisebo", "xingf", "shaonv", "renqi", "lemi", 'cshuang']
+
+    def save_config(self, port, token_dict, code):
+        config = ConfigParser()
+
+        # 保存通用配置
+        config['COMMON'] = {
+            'Port': port,
+            'Code': code
+        }
+
+        # 保存小组Cookie到统一分区（已在 manual_save 里做过规范化，这里直接保存）
+        config['GROUP_COOKIES'] = {group: token for group, token in token_dict.items()}
+
+        with open('config.ini', 'w', encoding='utf-8') as configfile:
+            config.write(configfile)
+
+    def load_config(self):
+        config = ConfigParser()
+        config.read('config.ini', encoding='utf-8')
+
+        if 'COMMON' in config:
+            self.port_input.setText(config['COMMON'].get('Port', ''))
+            self.code_input.setText(config['COMMON'].get('Code', ''))
+
+        if 'GROUP_COOKIES' in config:
+            for group, token in config['GROUP_COOKIES'].items():
+                if group in self.token_inputs:
+                    # 这里直接回填保存时的字符串（可能是 "cookie1,cookie2"）
+                    self.token_inputs[group].setText(token)
+
+    def manual_save(self):  # 手动保存配置（支持中文逗号->英文逗号、去重、去空格、去空项）
+        port = self.port_input.text().strip()
+        code = self.code_input.text().strip()
+
+        token_dict = {}
+        missing_groups = []
+
+        for group, input_field in self.token_inputs.items():
+            raw = input_field.text().strip()
+
+            # --- 修改点：自动把中文逗号替换为英文逗号 ---
+            raw = raw.replace("，", ",")
+
+            # 拆分、去空格、去空项
+            parts = [p.strip() for p in raw.split(",") if p.strip()]
+
+            # 去重（保持顺序）
+            seen = set()
+            tokens = []
+            for p in parts:
+                if p not in seen:
+                    seen.add(p)
+                    tokens.append(p)
+
+            if tokens:
+                # 规范化后再回填到输入框（用户一眼能看到被清洗后的结果）
+                normalized = ",".join(tokens)
+                input_field.setText(normalized)
+                token_dict[group] = normalized
+                input_field.setStyleSheet("")  # 清除红框
+            else:
+                # 该组为空：标红提示
+                missing_groups.append(group)
+                input_field.setStyleSheet("border: 1px solid red;")
+
+        if not port or not code:
+            QMessageBox.warning(self, "警告", "请填写完整的配置（port和code）！")
+            return
+
+        # 保存（规范化后的 token_dict）
+        self.save_config(port, token_dict, code)
+
+        if missing_groups:
+            missing_text = "、".join(missing_groups)
+            QMessageBox.information(self, "部分保存成功", f"配置已保存，但以下小组未填写 Cookie：{missing_text}")
+        else:
+            QMessageBox.information(self, "提示", "✅ 配置已完整保存！")
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = UserWindow()
+    window.show()
+    sys.exit(app.exec_())
