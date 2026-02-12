@@ -1,0 +1,746 @@
+import sys
+from PyQt5.QtWidgets import QApplication, QWidget, QLineEdit, QPushButton, QMessageBox, QFileDialog, \
+    QProgressBar, QTextEdit, QLabel, QDateTimeEdit
+from configparser import ConfigParser
+import requests
+from datetime import datetime
+from openpyxl import Workbook
+import os
+from PyQt5.QtCore import QThread, pyqtSignal
+from openpyxl.styles import Font
+import time
+
+# 声明全局变量 ids
+user_ids = []
+
+# 创建一个线程类用于处理后台任务
+class DataFetchThread(QThread):
+    progress_update = pyqtSignal(int)  # 用于更新进度条
+    log_update = pyqtSignal(str)  # 用于更新日志信息
+    finished = pyqtSignal()  # 当任务完成时发射信号
+    error_signal = pyqtSignal(str)  # 用于发送错误信息的信号
+
+    def __init__(self, ht, port, token, code, zjm, start_date, end_date, user_ids):
+        super().__init__()  # 调用父类的构造方法
+        self.ht = ht  # 初始化ht属性
+        self.port = port  # 初始化port属性
+        self.token = token  # 初始化token属性
+        self.code = code  # 初始化code属性
+        self.zjm = zjm  # 初始化code属性
+        self.start_date = start_date  # 初始化start_date属性
+        self.end_date = end_date  # 初始化end_date属性
+        self.user_ids = user_ids  # 初始化user_ids属性
+        self.data_list = []  # 用于保存获取到的数据
+
+    def run(self):
+        try:
+            headers = {
+                'Accept': 'application/json, text/plain, */*',
+                'Accept-Encoding': 'gzip, deflate',
+                'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+                'Connection': 'keep-alive',
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Cookie': f'token={self.token}',
+                'Host': f'{self.ht}.boinht.com:{self.port}',
+                'Origin': f'http://{self.ht}.boinht.com:{self.port}',
+                'Referer': f'http://{self.ht}.boinht.com:{self.port}/admin.html',
+                'User-Agent': self.zjm,
+            }
+
+            def fetch_data(url, data):
+                try:
+                    response = requests.post(url, data=data, headers=headers)
+                    response.raise_for_status()
+                    return response.json().get('result', [])
+                except requests.exceptions.HTTPError as e:
+                    # 仅提取并显示状态码
+                    status_code = e.response.status_code
+                    self.log_update.emit(f"用户 {user_id} 请求失败，状态码: {status_code}")
+                    return None
+                except requests.RequestException as e:
+                    # 处理非HTTP错误
+                    self.log_update.emit("请求失败，可能是网络或其他异常")
+                    return None
+
+            url1 = f"http://{self.ht}.boinht.com:{self.port}/user/pf_list_with_game"  # 用户列表
+            url2 = f"http://{self.ht}.boinht.com:{self.port}/user/get_user_game_data_by_app_userid"  # 用户列表/显示
+            url3 = f"http://{self.ht}.boinht.com:{self.port}/pp_user/recent_overview_by_userid"  # 用户列表/概况
+
+            max_retries = 10  # 设置最多请求10次
+
+            for idx, user_id in enumerate(self.user_ids):
+                attempts = 0
+                request_success = False
+
+                self.progress_update.emit(idx + 1)
+
+                while attempts < max_retries and not request_success:
+                    attempts += 1
+                    try:
+                        # 第一个请求
+                        data1 = {
+                            'channel_id': self.ht,
+                            'open_channel_id': '',
+                            'id': user_id,
+                            'game_user_id': '',
+                            'is_bind': '',
+                            'is_black': '',
+                            'nickname': '',
+                            'is_online': '',
+                            'reg_ip': '',
+                            'is_recharge': '',
+                            'device_type': '',
+                            'mobile': '',
+                            'apns_code': '',
+                            'begin_time': '',
+                            'end_time': '',
+                            'page_size': 32,
+                            'page': 1,
+                            "login_code": self.code,
+                        }
+                        data11 = fetch_data(url1, data1)
+
+                        if data11 is None:
+                            self.log_update.emit(f"用户 {user_id} 请求失败，重试第 {attempts} 次...")
+                            time.sleep(4)
+                            continue  # 回到第一个请求重新执行
+
+                        for aa in data11:
+                            appid = aa.get('id')
+                            最后登录ip = aa.get('last_ip')
+                            商户 = aa.get('channel_id')
+                            渠道 = aa.get('open_channel_id')
+                            打赏 = aa.get('use_diamond', 0)
+                            钻石 = aa.get('diamond', 0)
+
+                            # 第二个请求
+                            data2 = {
+                                "user_id": appid,
+                                "login_code": self.code,
+                            }
+                            data22 = fetch_data(url2, data2)
+
+                            if data22 is None:
+                                self.log_update.emit(f"用户 {user_id} 请求失败，重试第 {attempts} 次...")
+                                time.sleep(4)
+                                break  # 回到第一个请求重新执行
+
+                            for dd in data22:
+                                游戏id = dd.get('id')
+                                总充值 = dd.get('total_recharge', 0)
+                                总提现 = dd.get('total_cash', 0)
+                                余额 = dd.get('money', 0)
+                                注册时间 = datetime.fromtimestamp(int(dd.get('create_time', 0)))
+                                最后登录时间 = datetime.fromtimestamp(int(dd.get('last_login', 0)))
+                                注册IP = dd.get('reg_ip', '')
+
+                                # 第三个请求
+                                data3 = {
+                                    "user_id": 游戏id,
+                                    "start_time": self.start_date,
+                                    "end_time": self.end_date,
+                                    "login_code": self.code,
+                                }
+                                data33 = fetch_data(url3, data3)
+
+                                if data33 is None:
+                                    self.log_update.emit(f"用户 {user_id} 请求失败，重试第 {attempts} 次...")
+                                    time.sleep(4)
+                                    break  # 回到第一个请求重新执行
+
+                                # 数据处理与日志记录
+                                for ff in data33:
+                                    有效投注 = ff.get('vaild_bet', 0) if ff.get('vaild_bet') is not None else 0
+                                    游戏损益 = ff.get('delta_bet_win', 0) if ff.get('delta_bet_win') is not None else 0
+                                    充值 = ff.get('recharge', 0)
+                                    提充客损 = ff.get('delta_recharge_cash', 0)
+                                    提现 = ff.get('cash', 0) if ff.get('cash') is not None else 0
+
+                                    log_message = "{:<10}\t{:<10}\t{:<10}\t{:<10}\t{:<10}\t{:<10}\t{:<10}\t{:<10}".format(
+                                        appid, 有效投注, 总充值, 总提现, 提充客损, 充值, 提现, 游戏损益)
+                                    self.log_update.emit(log_message)
+
+                                    其他 = f'总充值：{总充值}/总提现：{总提现}/打赏："{打赏}"/钻石："{钻石}"/余额：{余额}'
+                                    渠道 = f'{商户}/{渠道}'
+
+                                    self.data_list.append([appid, 有效投注, 其他, 注册IP, 最后登录ip,
+                                                           注册时间, 最后登录时间, 提充客损, 充值, 提现, 游戏损益,
+                                                           游戏id,
+                                                           渠道])
+
+                                request_success = True  # 成功获取数据，结束重试
+                                break
+
+                    except Exception as e:
+                        self.log_update.emit(f"出现错误: {e}")
+                        time.sleep(4)
+                        continue  # 出现异常时重新从第一个请求开始
+
+                if not request_success:
+                    # 在请求失败的情况下，将失败的账号信息加入 data_list
+                    failure_entry = [user_id, '请求失败或数据不完整', '', '', '', '', '', '', '', '', '', '', '']
+                    self.data_list.append(failure_entry)
+                    self.log_update.emit(f"用户 {user_id} 的请求不完整，超过最大重试次数。")
+
+            self.finished.emit()
+            当前时间 = datetime.now()
+            dq = 当前时间.strftime('%Y年%m月%d日%H时%M分%S秒')
+            self.log_update.emit(f"数据处理完成，请点击导出数据进行保存   完成时间 {dq}")
+
+        except Exception as e:
+            self.log_update.emit(f"出现错误: {e}")
+            self.error_signal.emit(str(e))
+
+# 创建第二个线程类用于处理后台任务
+class DataFetchThrea(QThread):
+    progress_update = pyqtSignal(int)  # 用于更新进度条
+    log_update = pyqtSignal(str)  # 用于更新日志信息
+    finished = pyqtSignal()  # 当任务完成时发射信号
+    error_signal = pyqtSignal(str)  # 用于发送错误信息的信号
+
+    def __init__(self, ht, port, token, code, zjm, start_date, end_date, user_ids):
+        super().__init__()
+        self.ht = ht
+        self.port = port
+        self.token = token
+        self.code = code
+        self.zjm = zjm
+        self.start_date = start_date
+        self.end_date = end_date
+        self.user_ids = user_ids
+        self.data_list = []
+
+    def run(self):
+        try:
+            headers = {
+                'Accept': 'application/json, text/plain, */*',
+                'Accept-Encoding': 'gzip, deflate',
+                'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+                'Connection': 'keep-alive',
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Cookie': f'token={self.token}',
+                'Host': f'{self.ht}.boinht.com:{self.port}',
+                'Origin': f'http://{self.ht}.boinht.com:{self.port}',
+                'Referer': f'http://{self.ht}.boinht.com:{self.port}/admin.html',
+                'User-Agent': self.zjm,
+            }
+
+            # 构建请求 URL
+            url = f"http://{self.ht}.boinht.com:{self.port}/user/pf_list_with_game"
+            max_retries = 10  # 设置最多请求10次
+
+            for idx, user_id in enumerate(self.user_ids):
+                request_success = False  # 请求成功标志
+                attempts = 0  # 重试计数
+
+                while attempts < max_retries:
+                    attempts += 1
+                    self.progress_update.emit(idx + 1)
+
+                    try:
+                        # 第一个请求
+                        data1 = {
+                            "channel_id": "",
+                            "open_channel_id": "",
+                            "id": "",
+                            "game_user_id": user_id,
+                            "is_bind": "",
+                            "is_black": "",
+                            "nickname": "",
+                            "is_online": "",
+                            "reg_ip": "",
+                            "is_recharge": "",
+                            "device_type": "",
+                            "mobile": "",
+                            "apns_code": "",
+                            "begin_time": "",
+                            "end_time": "",
+                            "page_size": 32,
+                            "page": 1,
+                            "login_code": self.code,
+                        }
+
+                        response = requests.post(url, data=data1, headers=headers)
+                        if response.status_code == 200:
+                            data1 = response.json().get('result', [])
+                            # 处理第一个请求的结果
+                            for dd in data1:
+                                appid = dd.get('app_user_id')
+                                最后登录ip = dd.get('last_ip')
+                                商户 = dd.get('channel_id')
+                                渠道 = dd.get('open_channel_id')
+                                打赏 = dd.get('use_diamond', 0)
+                                钻石 = dd.get('diamond', 0)
+
+                                游戏id = dd.get('game_user_id')
+                                总充值 = dd.get('total_recharge', 0)
+                                总提现 = dd.get('total_cash', 0)
+                                余额 = dd.get('money', 0)
+                                注册时间 = datetime.fromtimestamp(int(dd.get('create_time', 0)))
+                                最后登录时间 = datetime.fromtimestamp(int(dd.get('last_login', 0)))
+                                注册IP = dd.get('reg_ip', '')
+
+                                # 第二个请求
+                                url2 = f"http://{self.ht}.boinht.com:{self.port}/pp_user/recent_overview_by_userid"
+                                data2 = {
+                                    "user_id": 游戏id,
+                                    "start_time": self.start_date,
+                                    "end_time": self.end_date,
+                                    "login_code": self.code,
+                                }
+
+                                response = requests.post(url2, data=data2, headers=headers)
+                                if response.status_code == 200:
+                                    data2 = response.json().get('result', [])
+                                    # 数据处理与日志记录
+                                    for ff in data2:
+                                        有效投注 = ff.get('vaild_bet', 0) if ff.get('vaild_bet') is not None else 0
+                                        游戏损益 = ff.get('delta_bet_win', 0) if ff.get('delta_bet_win') is not None else 0
+                                        充值 = ff.get('recharge', 0) if ff.get('recharge') is not None else 0
+                                        提充客损 = ff.get('delta_recharge_cash', 0) if ff.get('delta_recharge_cash') is not None else 0
+                                        提现 = ff.get('cash', 0) if ff.get('cash') is not None else 0
+
+                                        log_message = "{:<10}\t{:<10}\t{:<10}\t{:<10}\t{:<10}\t{:<10}\t{:<10}\t{:<10}".format(
+                                            游戏id, 有效投注, 总充值, 总提现, 提充客损, 充值, 提现, 游戏损益)
+                                        self.log_update.emit(log_message)
+
+                                        其他 = f'总充值：{总充值}/总提现：{总提现}/打赏："{打赏}"/钻石："{钻石}"/余额：{余额}'
+                                        渠道 = f'{商户}/{渠道}'
+
+                                        self.data_list.append([appid, 有效投注, 其他, 注册IP, 最后登录ip,
+                                                               注册时间, 最后登录时间, 提充客损, 充值, 提现, 游戏损益,
+                                                               游戏id,
+                                                               渠道])
+
+                                    request_success = True  # 成功获取数据，结束重试
+                                    break  # 跳出内层循环，继续下一个用户
+                                else:
+                                    self.log_update.emit(f"用户 {user_id} 请求失败，状态码: {response.status_code}")
+                                    self.log_update.emit(f"用户 {user_id} 请求失败，重试第 {attempts} 次...")
+                                    time.sleep(4)  # 等待后重试
+
+                            if request_success:  # 如果第一个请求成功但第二个请求失败，不进入下一用户
+                                break
+
+                        else:
+                            self.log_update.emit(f"用户 {user_id} 请求失败，状态码: {response.status_code}")
+                            self.log_update.emit(f"用户 {user_id} 请求失败，重试第 {attempts} 次...")
+                            time.sleep(4)  # 等待后重试
+
+                    except Exception as e:
+                        self.log_update.emit(f"出现错误: {e}")
+                        self.log_update.emit(f"用户 {user_id} 请求失败，重试第 {attempts} 次...")
+                        time.sleep(4)  # 等待后重试
+
+                if not request_success:
+                    # 在请求失败的情况下，将失败的账号信息加入 data_list
+                    failure_entry = [user_id, '请求失败或数据不完整', '', '', '', '', '', '', '', '']
+                    self.data_list.append(failure_entry)
+                    self.log_update.emit(f"用户 {user_id} 的请求不完整，超过最大重试次数。")
+
+            self.finished.emit()
+            当前时间 = datetime.now()
+            dq = 当前时间.strftime('%Y年%m月%d日%H时%M分%S秒')
+            self.log_update.emit(f"数据处理完成，请点击导出数据进行保存   完成时间 {dq}")
+
+        except Exception as e:
+            self.log_update.emit(f"出现错误: {e}")
+            self.error_signal.emit(str(e))
+
+class LoginWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.initUI()
+        self.data_list = []  # 初始化数据列表
+
+        # 创建线程实例
+        self.thread = None  # 初始化线程实例为 None
+
+    def initUI(self):  # 初始化界面
+        self.setWindowTitle('直播大数据获取__版本20241031')
+        self.setGeometry(300, 100, 1320, 680)
+
+        # 创建日志框标头标签
+        self.lbl_account = QLabel('appid               打码                总充值              总提现              提充客损             充值                提现                游戏损益', self)
+        self.lbl_account.setGeometry(15, 0, 1320, 30)
+
+        # 创建后台输入框
+        self.srk_ht = QLineEdit(self)
+        self.srk_ht.setPlaceholderText('后台')
+        self.srk_ht.setGeometry(50, 380, 500, 40)
+
+        # 创建端口输入框
+        self.srk_port = QLineEdit(self)
+        self.srk_port.setPlaceholderText('port')
+        self.srk_port.setGeometry(50, 430, 500, 40)
+
+        # 创建密码输入框
+        self.srk_token = QLineEdit(self)
+        self.srk_token.setPlaceholderText('Cookie')
+        self.srk_token.setGeometry(50, 480, 500, 40)
+
+        self.srk_code = QLineEdit(self)
+        self.srk_code.setPlaceholderText('小明登录码')
+        self.srk_code.setGeometry(50, 530, 500, 40)
+
+        self.srk_zjm = QLineEdit(self)
+        self.srk_zjm.setPlaceholderText('User-Agent')
+        self.srk_zjm.setGeometry(50, 580, 500, 40)
+
+        # 创建手动保存按钮
+        self.save_button = QPushButton("保存配置", self)
+        self.save_button.setGeometry(225, 630, 150, 40)
+        self.save_button.clicked.connect(self.manual_save)
+
+        # 创建选择文件按钮
+        self.file_button = QPushButton("选择文件", self)
+        self.file_button.setGeometry(680, 380, 300, 40)
+        self.file_button.clicked.connect(self.xzwj)
+        self.file_button.setStyleSheet("""
+            QPushButton {
+                background-color: rgb(255, 192, 203, 1);  /* 粉色 */
+                border: none;  /* 去掉边框 */
+                border-radius: 15px;  /* 圆角，调整为较大的值 */
+                font-size: 20px;  /* 字体大小 */
+                font-weight: bold;  /* 字体加粗 */
+            }
+            QPushButton:hover {
+                background-color: rgba(0, 200, 0, 1);
+            }
+        """)
+
+        # 开始时间
+        self.srk_kssj = QDateTimeEdit(self)
+        self.srk_kssj.setCalendarPopup(True)
+        self.srk_kssj.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
+        self.srk_kssj.setGeometry(680, 440, 300, 40)
+
+        # 结束时间，默认时分秒为 23:59:59
+        self.srk_jssj = QDateTimeEdit(self)
+        self.srk_jssj.setCalendarPopup(True)
+        self.srk_jssj.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
+        self.srk_jssj.setGeometry(680, 500, 300, 40)
+
+        # 设置默认日期
+        current_date = datetime.now().date()
+        self.srk_kssj.setDate(current_date)
+        self.srk_jssj.setDate(current_date)
+
+        # 创建获取数据按钮
+        self.submit_button = QPushButton('APPID_获取大数据', self)
+        self.submit_button.setGeometry(600, 590, 200, 40)
+        self.submit_button.clicked.connect(self.print_account)  # 修改为启动数据获取
+        self.submit_button.setStyleSheet("""
+            QPushButton {
+                background-color: rgb(210, 180, 140, 1);
+                border: none;  /* 去掉边框 */
+                border-radius: 15px;  /* 圆角，调整为较大的值 */
+                font-size: 20px;  /* 字体大小 */
+                font-weight: bold;  /* 字体加粗 */
+            }
+            QPushButton:hover {
+                background-color: rgba(255, 60, 60, 0.8);
+            }
+        """)
+
+        # 创建获取数据按钮
+        self.submi_button = QPushButton('游戏ID_获取大数据', self)
+        self.submi_button.setGeometry(850, 590, 200, 40)
+        self.submi_button.clicked.connect(self.print_accoun)  # 修改为启动数据获取
+        self.submi_button.setStyleSheet("""
+            QPushButton {
+                background-color: rgb(180, 200, 140, 1);
+                border: none;  /* 去掉边框 */
+                border-radius: 15px;  /* 圆角，调整为较大的值 */
+                font-size: 20px;  /* 字体大小 */
+                font-weight: bold;  /* 字体加粗 */
+            }
+            QPushButton:hover {
+                background-color: rgba(255, 60, 60, 0.8);
+            }
+        """)
+
+        # 创建导出数据按钮
+        self.export_button = QPushButton('导出数据', self)
+        self.export_button.setGeometry(1050, 480, 250, 40)
+        self.export_button.clicked.connect(self.export_data)
+        self.export_button.setStyleSheet("""
+            QPushButton {
+                background-color: rgb(220, 100, 200, 0.5);  /* 棕黄色 */
+                border: none;  /* 去掉边框 */
+                border-radius: 15px;  /* 圆角，调整为较大的值 */
+                font-size: 20px;  /* 字体大小 */
+                font-weight: bold;  /* 字体加粗 */
+            }
+            QPushButton:hover {
+                background-color: rgba(220, 100, 200, 1);  /* 鼠标悬停颜色 */
+            }
+        """)
+
+        # 创建日志框
+        self.log_box = QTextEdit(self)
+        self.log_box.setReadOnly(True)
+        self.log_box.setGeometry(10, 40, 1300, 300)
+
+        # 创建进度条
+        self.progress_bar = QProgressBar(self)  # 创建一个进度条部件并将其父级设置为 'self'
+        self.progress_bar.setGeometry(10, 340, 1310, 30)  # 设置进度条的位置 (x=20, y=390) 和大小 (宽度=280, 高度=30)
+        self.progress_bar.setMinimum(0)  # 将进度条的最小值设置为 0
+
+        # 连接日志更新信号
+        self.load_config()
+
+    def save_config(self, ht, port, token, code, zjm):  # 保存配置到文件
+        config = ConfigParser()
+        config['USER'] = {'ht': ht, 'Port': port,  'Token': token, 'Code': code, 'zjm': zjm}
+        with open('config.ini', 'w') as configfile:
+            config.write(configfile)
+
+    def load_config(self):  # 从文件加载配置
+        config = ConfigParser()
+        config.read('config.ini')
+        if 'USER' in config:
+            self.srk_ht.setText(config['USER']['ht'])
+            self.srk_port.setText(config['USER']['port'])
+            self.srk_token.setText(config['USER']['Token'])
+            self.srk_code.setText(config['USER']['Code'])
+            self.srk_zjm.setText(config['USER']['zjm'])
+
+    def print_account(self):
+        # 获取输入框中的内容
+        ht = self.srk_ht.text()  # 获取ht文本框中的内容
+        port = self.srk_port.text()  # 获取token文本框中的内容
+        token = self.srk_token.text()  # 获取token文本框中的内容
+        code = self.srk_code.text()  # 获取token文本框中的内容
+        zjm = self.srk_zjm.text()  # 获取token文本框中的内容
+        # 获取开始时间和结束时间
+        ks = self.srk_kssj.dateTime().toString("yyyy-MM-dd HH:mm:ss")
+        js = self.srk_jssj.dateTime().toString("yyyy-MM-dd HH:mm:ss")
+
+        # 将时间字符串转换为时间戳
+        kssj = datetime.strptime(ks, '%Y-%m-%d %H:%M:%S')
+        jssj = datetime.strptime(js, '%Y-%m-%d %H:%M:%S')
+        print(kssj)
+        print(jssj)
+
+        start_date = int(kssj.timestamp())
+        end_date = int(jssj.timestamp())
+        print(start_date)
+        print(end_date)
+
+        # 检查文件路径是否存在
+        if not hasattr(self, 'file_path'):
+            QMessageBox.warning(self, "警告", "请先选择用户ID文件！")  # 如果文件路径不存在则弹出警告
+            return
+
+        # 读取文件中用户ID
+        try:
+            with open(self.file_path, 'r', encoding='utf-8') as file:
+                user_ids = [uid.strip() for uid in file.readlines() if uid.strip()]  # 读取文件中的用户ID并去除空格
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"读取文件失败: {str(e)}")  # 如果读取文件失败则弹出错误提示
+            return
+
+        self.progress_bar.setMaximum(len(user_ids))  # 设置进度条最大值为用户ID数量
+
+        self.submit_button.setEnabled(False)  # 禁用“APPID获取数据”按钮
+        self.submi_button.setEnabled(False)  # 禁用“游戏ID获取数据”按钮
+        self.export_button.setEnabled(False)  # 禁用“导出数据”按钮
+        self.file_button.setEnabled(False)  # 禁用“选择文件”按钮
+        self.srk_kssj.setEnabled(False)  # 禁用开始时间
+        self.srk_jssj.setEnabled(False)  # 禁用结束时间
+
+        self.srk_ht.setEnabled(False)  # 禁用后台
+        self.srk_port.setEnabled(False)  # 禁用port
+        self.srk_token.setEnabled(False)  # 禁用token
+        self.srk_code.setEnabled(False)  # 禁用code
+        self.srk_zjm.setEnabled(False)  # 禁用zjm
+        self.save_button.setEnabled(False)  # 禁用保存配置
+
+        # 创建并启动后台线程
+        self.thread = DataFetchThread(ht, port, token, code, zjm, start_date, end_date, user_ids)  # 创建数据获取线程
+        self.thread.progress_update.connect(self.update_progress_bar)  # 连接进度更新信号
+        self.thread.log_update.connect(self.update_log_box)  # 连接日志更新信号
+        self.thread.finished.connect(self.on_task_finished)  # 连接任务完成信号
+        self.thread.error_signal.connect(self.handle_error)  # 连接错误信号
+
+        self.thread.start()  # 启动线程
+
+        # 清空日志框
+        self.clear_log_box()
+
+    def print_accoun(self):
+        # 获取输入框中的内容
+        ht = self.srk_ht.text()  # 获取ht文本框中的内容
+        port = self.srk_port.text()  # 获取token文本框中的内容
+        token = self.srk_token.text()  # 获取token文本框中的内容
+        code = self.srk_code.text()  # 获取token文本框中的内容
+        zjm = self.srk_zjm.text()  # 获取token文本框中的内容
+        # 获取开始时间和结束时间
+        ks = self.srk_kssj.dateTime().toString("yyyy-MM-dd HH:mm:ss")
+        js = self.srk_jssj.dateTime().toString("yyyy-MM-dd HH:mm:ss")
+
+        # 将时间字符串转换为时间戳
+        kssj = datetime.strptime(ks, '%Y-%m-%d %H:%M:%S')
+        jssj = datetime.strptime(js, '%Y-%m-%d %H:%M:%S')
+        print(kssj)
+        print(jssj)
+
+        start_date = int(kssj.timestamp())
+        end_date = int(jssj.timestamp())
+        print(start_date)
+        print(end_date)
+
+        # 检查文件路径是否存在
+        if not hasattr(self, 'file_path'):
+            QMessageBox.warning(self, "警告", "请先选择用户ID文件！")  # 如果文件路径不存在则弹出警告
+            return
+
+        # 读取文件中用户ID
+        try:
+            with open(self.file_path, 'r', encoding='utf-8') as file:
+                user_ids = [uid.strip() for uid in file.readlines() if uid.strip()]  # 读取文件中的用户ID并去除空格
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"读取文件失败: {str(e)}")  # 如果读取文件失败则弹出错误提示
+            return
+
+        self.progress_bar.setMaximum(len(user_ids))  # 设置进度条最大值为用户ID数量
+
+        self.submit_button.setEnabled(False)  # 禁用“APPID获取数据”按钮
+        self.submi_button.setEnabled(False)  # 禁用“游戏ID获取数据”按钮
+        self.export_button.setEnabled(False)  # 禁用“导出数据”按钮
+        self.file_button.setEnabled(False)  # 禁用“选择文件”按钮
+        self.srk_kssj.setEnabled(False)  # 禁用开始时间
+        self.srk_jssj.setEnabled(False)  # 禁用结束时间
+
+        self.srk_ht.setEnabled(False)  # 禁用后台
+        self.srk_port.setEnabled(False)  # 禁用port
+        self.srk_token.setEnabled(False)  # 禁用token
+        self.srk_code.setEnabled(False)  # 禁用code
+        self.srk_zjm.setEnabled(False)  # 禁用zjm
+        self.save_button.setEnabled(False)  # 禁用保存配置
+
+        # 创建并启动后台线程
+        self.thread = DataFetchThrea(ht, port, token, code, zjm, start_date, end_date, user_ids)  # 创建数据获取线程
+        self.thread.progress_update.connect(self.update_progress_bar)  # 连接进度更新信号
+        self.thread.log_update.connect(self.update_log_box)  # 连接日志更新信号
+        self.thread.finished.connect(self.on_task_finished)  # 连接任务完成信号
+        self.thread.error_signal.connect(self.handle_error)  # 连接错误信号
+
+        self.thread.start()  # 启动线程
+
+        # 清空日志框
+        self.clear_log_box()
+
+    def clear_log_box(self):
+        self.log_box.clear()  # 清空日志框的内容
+
+    def handle_error(self, error_message):
+        QMessageBox.critical(self, "错误", f"发生错误: {error_message}")  # 显示错误消息框
+
+    def update_progress_bar(self, value):
+        self.progress_bar.setValue(value)  # 更新进度条的数值
+
+    def update_log_box(self, message):
+        self.log_box.append(message)  # 更新日志框的内容
+
+    def on_task_finished(self):
+        QMessageBox.information(self, "提示", "数据获取完成！")
+        self.data_list = self.thread.data_list  # 将获取到的数据保存到主窗口的列表中
+
+        # 重新启用按钮
+        self.submit_button.setEnabled(True)  # 启用“APPID获取数据”按钮
+        self.submi_button.setEnabled(True)  # 启用“游戏ID获取数据”按钮
+        self.export_button.setEnabled(True)  # 启用“导出数据”按钮
+        self.file_button.setEnabled(True)  # 启用“选择文件”按钮
+        self.srk_kssj.setEnabled(True)  # 启用开始时间
+        self.srk_jssj.setEnabled(True)  # 启用结束时间
+
+        self.srk_ht.setEnabled(True)  # 启用后台
+        self.srk_port.setEnabled(True)  # 启用port
+        self.srk_token.setEnabled(True)  # 启用token
+        self.srk_code.setEnabled(True)  # 启用code
+        self.srk_zjm.setEnabled(True)  # 启用zjm
+        self.save_button.setEnabled(True)  # 启用保存配置
+
+    def xzwj(self):  # 选择文件函数
+        options = QFileDialog.Options()
+        desktop_path = os.path.join(os.path.expanduser("~"), 'Desktop')  # 获取桌面路径
+        file_path, _ = QFileDialog.getOpenFileName(self, "选择文件", desktop_path,
+                                                   "All Files (*);;Text Files (*.txt)",
+                                                   options=options)
+        if file_path:
+            self.file_path = file_path  # 保存文件路径
+            with open(self.file_path, 'r') as f:
+                lines = f.readlines()
+                account_count = len(lines)  # 计算账号的数量
+            QMessageBox.information(self, "提示", f"成功导入文件！共有 {account_count} 个账号。")
+        else:
+            QMessageBox.warning(self, "警告", "没有选择任何文件！")
+
+    def manual_save(self):  # 手动保存函数  port
+        ht = self.srk_ht.text()
+        port = self.srk_port.text()
+        token = self.srk_token.text()
+        code = self.srk_code.text()
+        zjm = self.srk_zjm.text()
+        if ht and port and token and code and zjm:
+            self.save_config(ht, port, token, code, zjm)
+            QMessageBox.information(self, "提示", "配置已保存！")
+        else:
+            QMessageBox.warning(self, "警告", "请填写完整的配置！")
+
+    def export_data(self):
+        if not self.data_list:
+            QMessageBox.warning(self, "警告", "没有数据可导出！")
+            return
+
+        # 创建 Excel 工作簿和工作表
+        wb = Workbook()
+        ws = wb.active
+
+        # 添加表头
+        ws.append(['appid', '打码', '其他', '注册IP', '最后登录ip', '注册时间', '最后登录时间',
+                   '提充客损', '充值', '提现', '游戏损益', '游戏id', '渠道',])
+
+        font = Font(size=12)
+        for cell in ws[1]:
+            cell.font = font
+
+        # 设置A到P列的宽度
+        column_widths = {
+            'A': 12,
+            'B': 9,
+            'C': 71,
+            'D': 20,
+            'E': 20,
+            'F': 20,
+            'G': 20,
+            'H': 10,
+            'I': 10,
+            'J': 10,
+            'K': 10,
+            'L': 16,
+            'M': 16,
+        }
+
+        for col, width in column_widths.items():
+            ws.column_dimensions[col].width = width
+
+        # 将数据写入工作表
+        for row in self.data_list:
+            ws.append(row)
+
+        # 生成文件名，使用当前时间
+        current_time = datetime.now().strftime("%Y年%m月%d日%H时%M分%S秒")  # 格式化时间为字符串
+
+        # 保存 Excel 文件
+        wb.save(f'导出数据{current_time}.xlsx')
+        # QMessageBox.information(self, "提示", "数据已导出" )
+        os.startfile(f'导出数据{current_time}.xlsx')  # 自动打开 Excel 文件
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)  # 创建应用程序对象
+    window = LoginWindow()  # 创建登录窗口对象
+    window.show()  # 显示窗口
+    sys.exit(app.exec_())  # 运行应用程序的主事件循环并退出程序
