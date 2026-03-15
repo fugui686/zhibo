@@ -1,0 +1,1040 @@
+import sys
+import os
+import requests
+import configparser
+from openpyxl import Workbook
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QLabel, QLineEdit,
+    QPushButton, QVBoxLayout, QHBoxLayout, QMessageBox, QFrame, QGroupBox,
+    QTabWidget
+)
+from PyQt5.QtCore import QTimer, QDateTime, QTime, QThread, pyqtSignal
+from datetime import datetime, timedelta
+from PyQt5.QtGui import QFont, QPixmap, QIcon
+from PyQt5.QtCore import QByteArray
+
+CONFIG_FILE = 'config.ini'
+
+
+class WorkerThread(QThread):
+    finished = pyqtSignal(str)
+
+    def __init__(self, task_func):
+        super().__init__()
+        self.task_func = task_func
+
+    def run(self):
+        try:
+            self.task_func()
+            self.finished.emit("success")
+        except requests.exceptions.ConnectionError as e:
+            if "Max retries exceeded" in str(e) or "Failed to establish" in str(e):
+                self.finished.emit("error: 连接服务器失败，请检查端口号是否正确或服务是否启动")
+            else:
+                self.finished.emit(f"error: 网络连接错误，请检查网络")
+        except requests.exceptions.Timeout:
+            self.finished.emit("error: 连接超时，请稍后重试")
+        except requests.exceptions.RequestException as e:
+            self.finished.emit(f"error: 网络请求异常")
+        except Exception as e:
+            error_str = str(e)
+            # 处理HTTP响应中的业务错误
+            if "login_code 校验失败" in error_str:
+                self.finished.emit("error: login_code 校验失败，请检查登录码")
+            elif "设备登陆中" in error_str:
+                self.finished.emit("error: 设备登陆中，请检查Cookie是否有效")
+            elif "Max retries exceeded" in error_str or "Failed to establish" in error_str:
+                self.finished.emit("error: 连接服务器失败，请检查端口号")
+            else:
+                # 其他未知错误，只显示前50个字符避免窗口撑宽
+                short_error = error_str[:50] + "..." if len(error_str) > 50 else error_str
+                self.finished.emit(f"error: {short_error}")
+
+
+class DataApp(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.init_ui()
+        self.check_network_validation()
+        self.load_config()
+        self.smart_mode_active = False
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.smart_mode_check)
+
+        self.time_timer = QTimer()
+        self.time_timer.timeout.connect(self.update_time)
+        self.time_timer.start(1000)
+        self.last_run_hour = -1
+        self.thread = None  # 初始化线程变量
+
+    def check_network_validation(self):
+        try:
+            program_id = "直播每小时数据_通用版"  # 每个程序用自己的名字（必须和JSON文件里的 key 对应）
+            response = requests.get("http://8.210.92.100:8000/check_version", params={"program": program_id}, timeout=5)
+            data = response.json()
+
+            status = data.get("status")
+
+            if status != "active":
+                QMessageBox.critical(self, "兼容性错误", "系统组件加载失败（Code: S-1）")
+                sys.exit(0)
+
+        except Exception:
+            QMessageBox.critical(self, "兼容性错误", "组件连接失败，请稍后重试（Code: S-2）")
+            sys.exit(0)
+
+    def init_ui(self):
+        self.setWindowTitle('直播每小时数据_通用版')
+        font_bold = QFont()
+        font_bold.setPointSize(16)
+        font_bold.setBold(True)
+
+        icon_base64 = "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//8iV///Ilf//yJX//8iV///Ilf//yJW//IiV/+HGFX/FQAAAAAAAAAAAAAAACFV/ychV//OIlf/5AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIVj/PSFW/88iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV//2Ilf/ryJX/5AiV/+1Ilf/+iJX//8iV//aAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJEn/ByFW/5IiVv/+Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/6UAAAAAAAAAAAAAAAAAAAAAAAAAACBV/xghVv/JIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/TAAAAAAAAAAAAAAAAAAAAAAhWv8fIVf/3SJX//8iV///Ilf//yJX/+giVv+9IVf/oSJX/5YiV/+cIlb/tCJX/98iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yFX/84AAP8BAAAAAAAAAAAAAAAAIVn/FyJX/9wiV///Ilb/ySJV/28jVf8kAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFS/x8hV/91Ilf/4CJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8hV//8IFf/OAAAAAAAAAAAAAAAACpV/wYiV//FIlf/rSJY/zQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACpV/wYgVv+OIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW/4gAAAAAAAAAAAAAAAAAAAAAIVf/VSBT/zcAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAhWf8XIlf/xSJX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AAAAAAAAIlb/dyJX//8hVv/PG1H/EwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIGD/CABV/wMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABxV/wkhV//lIVf/wh5a/xEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIVj/eiJX/5wkSf8HAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFZ/xciVv9TAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKAAAADAAAABgAAAAAQAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/AUBA/wQqVf8GJEn/BzNm/wUAAP8BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/wEgUP8QHlX/MyJW/1MhWP9rIlf/fiNW/4whV/+SIVb/lCJX/40iVv9/I1f/ZiJW/0QgVf8YAAD/AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFT/y4hWf8XAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAaTf8KIlf/TCFY/6AjV//VIVf/5SJX//AiV//4Ilf//iJX//8iV///Ilf//yJX//8iVv/+Ilf/9yJX/+siV//YIlf/liNX/ywAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJFv/KiJX/9AjV/9JAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAcVf8JHVf/IyFW/3whV//fIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW//ghVv+gIVf/Lxdd/wsAAAAAAAAAAAAAAAAAAAAAAAAAACpV/wYkWP9AIVj/3SJX//UhWP9jAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACNU/zoiVv+UIlf/5CJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/6iJX/54gWP9XIlP/JSBg/xAcVf8bI1X/QiFX/4oiV//iIlf//yJX//YhVv9lAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAbXv8TIlf/kCJX/+giV//8Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//4iV//xIlf/4SJX/9ohV//dIlf/6iJX//wiV///Ilf//yJX//EhV/9VAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQED/BCBY/zciV//IIlf//iJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yNX/+UkV/8yAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgUP8QIVb/cyJX/+ciV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW/8MaTf8KAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACdi/w0iV/+VIlf/9iJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/2EAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHFX/EiNW/6EiV///Ilf//yJX//8iV///Ilf//yJX//oiV//vIlf/5yJX/+EhV//dIlf/3CNX/90iV//hIlf/6CJX//EiV//8Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/0kBA/wQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAjWP8dIVf/qCJX//8iV///Ilf//yJX//YhV//HIVf/mSJY/3EfWP9RIFj/NyJT/yUdWP8aIVn/FydY/xoiV/8mI1j/OiNY/1chVv98Ilf/qiJX/+EiV//+Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iVv/vIlf/TAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACdO/w0hWP+aIlf/+yJX//8iV//nIVb/iyRX/zIgVf8YHFX/CQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgP8CJFv/DiJa/yUhVv9zIlf/6CJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//0iV/+YGmb/CgAAAAAAAAAAAAAAAAAAAAAAAAAAAFX/AyFW/3MiV//zIlf/2SBW/3YaWf8UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/wEcVf8SIlf/gSJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/9giU/8lAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIFf/WCJW/8MgV/9vHVj/GgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACJb/y0iV/+tIlf/+SJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/74AQP8EAAAAAAAAAAAAAAAAAAAAAAAAAAAgWP8gIlb/WR1Y/xoAVf8DAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIFT/QCFX/94iV//9Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/+AiWv8lAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP8BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBA/wQiVv9TIlj/6yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yFX/+0iVv9KAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACJX/2EiV//iIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//YhWP9jAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP8BI1f/bCJX//EiV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//shVv90AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBA/wQhWP9jIlf/8SJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//0hV/97AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACJY/1oiV//kIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iVv/+IVf/xyFW/94iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//0iV/94AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIlb/UyJX/+4iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//ojV/+bIFj/ICJX/4EiV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//kjVv9uAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACA/wIhV/9GIlj/6SJX//8iV///Ilf//yJX//0iV//uIVb/8CJX//8iV///Ilf//yJX//8iV//+Ilf/6CJX/3AAZv8FAAAAACBT/zciVv/7Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//IiVv9ZAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFV/zYiV//RIlf//yJX//8iV///Ilf/9iFX/6ghVv+xIlf/9yJX//8iV///Ilf//yJW//shVv+3IVj/PQAAAAAAAAAAAAAAACBY/yAhV//dIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/+giVf88AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIlX/HiJX/9giV//+Ilf//yJX//8iV//cJFj/TiBX/28iVv/yIlf//yJX//8iV///Ilb//iFX/4wjXf8WAAD/AQAAAAAAAAAAAAAAACNR/xYhV//BIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/9whWf8XAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAjWP8dIlj/ySJX//8iV///Ilf/9iJX/7YgWf8oH1b/SiJX//kiV///Ilf//yJX//0iV//fIVn/VgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACBQ/xAiVv+uIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW/6wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB5a/xEhVv+kIlf/+yJX//8hV//dIln/cCdO/w0hVv8+Ilf/3yJX//8iV///Ilf//yFW/7cjWP86AFX/AwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACdO/w0iV/+lIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yFW/00AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACJX/5AiV//5Ilf//yJX/88gV/84AED/BCFZ/xciV//BIlf//iJX//8iV//5Ilb/hiZZ/xQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACpV/wwhVv+jIlf//yJX//8iV///Ilf//yJX//8iV///IVf/2CRJ/wcAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAqVf8GIlb/cSJX//8iV//zIlf/pBRO/w0AAAAAHFX/CSJX/5wiV///Ilf//yJW/+YiV/9pM2b/BQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACJV/w8iVv+rIlf//yJX//8iV///Ilf//yJX//8hV//8IFX/ZgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBA/wQiVv9ZIVf/7SFX/+UhV/9sGk3/CgAAAAAqVf8GIVf/eyJX//0iVv/+Ilf/xCFX/0YAVf8DAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACZZ/xQiVv+6Ilf//yJX//8iV///Ilf//yJX//8iVv/JHVj/GgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFZ/y4hV//eIVf/1yJY/zQzZv8FAAAAAAAAAAAiV/9SIVb/7CJX//wiV/+nIFj/IAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACRb/xwiV//SIlf//yJX//8iV///Ilf//yJX//UiV/9qAID/AgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAH1z/GSFX/84jVv+xH1z/GQAAAAAAAAAAAAAAACRX/yMiV//LIVf/9CJW/5cnYv8NAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB9X/ykiV//wIlf//yJX//8iV///Ilf//yJX/74iVf8PAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAdWP8aIlf/pyJX/4cgVf8YAAAAAAAAAAAAAAAAGk3/CiJX/6ciV//gIlf/aQBm/wUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACNX/1giV///Ilf//yJX//8iV///Ilf/3yFT/y4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACBg/wgiV/9yIFb/UCBg/wgAAAAAAAAAAAAAAAAAAP8BIlj/hiJX/+EgVv9HQED/BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACJX/6ciV///Ilf//yJX//8iV//wIlj/SwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/ASFX/y8hVv8+AAD/AQAAAAAAAAAAAAAAAACA/wIiVf9LIlf/wiJV/y0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIFD/ECNX//MiV///Ilf//yJX//YhVv96KlX/BgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/AhxV/xsAAAAAAAAAAAAAAAAAAAAAAAAAABxV/xshVv96Ilf/JgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIlX/byJX//8iV///Ilf//SNY/4sgUP8QAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACNX/1gfUv8ZAAD/AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAeWv8RI1f/ziJX//8iV//8IVb/ghpm/woAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIFX/GBxV/wkAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/wEiWP9aIlf/8SFX//QjVv+FGk3/CgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB5a/xEhVv+yIlb/6SBX/28VVf8MAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFX/1UiVv/PIFn/PwBA/wQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHFX/EiJX/58hVf8nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIlP/JSJV/w8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="  # 替换成你的 base64
+        icon_data = QByteArray.fromBase64(icon_base64.encode())
+
+        # 更可靠的图标加载方式
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(icon_data, "ICO"):  # 显式指定格式
+            print("❌ 图标加载失败！请检查 base64 数据或文件格式")
+        else:
+            self.setWindowIcon(QIcon(pixmap))  # 设置窗口和任务栏图标
+
+        self.setStyleSheet(""" QLabel { font-size: 14px; }
+            QLineEdit {
+                font-size: 14px; padding: 5px;
+                border: 1px solid #ccc; border-radius: 5px;
+                background-color: white;
+            }
+            QLineEdit:hover {
+                border: 1px solid #2196f3;
+            }
+            QPushButton {
+                font-size: 14px; padding: 6px 14px;
+                background-color: white; border: 1px solid #2196f3;
+                border-radius: 6px; color: #333;
+            }
+            QPushButton:hover {
+                background-color: #e3f2fd; border: 1px solid #1976d2; color: #000;
+            }
+            QPushButton:pressed {
+                background-color: #bbdefb; border: 1px solid #1565c0;
+            }
+            QGroupBox {
+                border: 1px solid #aaa; border-radius: 8px; margin-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top center;
+                padding: 0 6px; font-size: 15px; font-weight: bold;
+            }
+            QPushButton:disabled {
+                background-color: #eee;
+                border: 1px solid #aaa;
+                color: #999;
+            }
+        """)
+
+        # 创建主布局
+        main_layout = QVBoxLayout()
+        main_layout.setSpacing(14)
+
+        # ===== 创建标签页 =====
+        tab_widget = QTabWidget()
+
+        # ===== 第一个标签页：基础配置 =====
+        tab1 = QWidget()
+        tab1_layout = QVBoxLayout()
+        tab1_layout.setSpacing(14)
+
+        # 基础配置输入区域
+        input_group = QGroupBox("基础配置")
+        input_layout = QVBoxLayout()
+
+        self.port_input = QLineEdit()
+        self.cookie_input = QLineEdit()
+        self.code_input = QLineEdit()
+
+        self.port_input.setPlaceholderText("请输入端口号，例如：8080")
+        self.cookie_input.setPlaceholderText("请输入Cookie")
+        self.code_input.setPlaceholderText("请输入小明计算器登录码")
+
+        for label_text, input_widget in [
+            ('🌐 端口号:', self.port_input),
+            ('🔑 Cookie:', self.cookie_input),
+            ('🔢 登录码:', self.code_input),
+        ]:
+            row = QHBoxLayout()
+            row.addWidget(QLabel(label_text))
+            row.addWidget(input_widget)
+            input_layout.addLayout(row)
+
+        input_group.setLayout(input_layout)
+        tab1_layout.addWidget(input_group)
+
+        # 按钮区域1
+        row1 = QHBoxLayout()
+        self.btn_save = QPushButton('💾 保存配置')
+        self.btn_today = QPushButton('📅 今日数据')
+        self.btn_yesterday = QPushButton('📆 昨日数据')
+        row1.addWidget(self.btn_save)
+        row1.addWidget(self.btn_today)
+        row1.addWidget(self.btn_yesterday)
+        tab1_layout.addLayout(row1)
+
+        # 按钮区域2
+        row2 = QHBoxLayout()
+        self.btn_smart = QPushButton('🤖 启动智能模式')
+        self.btn_stop = QPushButton('🛑 停止智能模式')
+        row2.addWidget(self.btn_smart)
+        row2.addWidget(self.btn_stop)
+        tab1_layout.addLayout(row2)
+
+        tab1_layout.addWidget(self._separator_line())
+
+        # 当前时间显示
+        self.time_label = QLabel()
+        self.time_label.setFont(font_bold)
+        self.time_label.setStyleSheet("background-color: #e0f7fa; padding: 10px; border-radius: 8px; font-size: 18px;")
+        tab1_layout.addWidget(self.time_label)
+
+        # 状态提示
+        self.status_label = QLabel("当前状态：未开启智能模式 ⛔")
+        self.status_label.setStyleSheet("font-size: 14px; color: red; font-weight: bold; padding-left: 4px;")
+        tab1_layout.addWidget(self.status_label)
+
+        # 结果提示
+        self.result_label = QLabel("")
+        self.result_label.setStyleSheet("font-size: 14px; color: gray; padding-left: 4px;")
+        tab1_layout.addWidget(self.result_label)
+
+        tab1.setLayout(tab1_layout)
+
+        # ===== 第二个标签页：支付方式配置 =====
+        tab2 = QWidget()
+        tab2_layout = QVBoxLayout()
+        tab2_layout.setSpacing(14)
+
+        # 支付方式配置区域
+        payment_group = QGroupBox("支付方式配置")
+        payment_group.setStyleSheet("QGroupBox { font-weight: bold; font-size: 14px; }")
+        payment_layout = QVBoxLayout()
+
+        # 说明标签
+        notice_label = QLabel("⚠️ 请谨慎修改支付ID，错误配置会导致数据统计异常,如需修改可联系管理员获取支付ID")
+        notice_label.setStyleSheet(
+            "color: #e67e22; font-weight: bold; padding: 5px; background-color: #fff3e0; border-radius: 3px;")
+        payment_layout.addWidget(notice_label)
+
+        # 支付ID输入框
+        self.bobi_payment_input = QLineEdit()
+        self.usdt_payment_input = QLineEdit()
+        self.bobi_cash_input = QLineEdit()  # 新增：波币提现ID
+
+        self.bobi_payment_input.setPlaceholderText("例如：200516")
+        self.usdt_payment_input.setPlaceholderText("例如：200626")
+        self.bobi_cash_input.setPlaceholderText("例如：10150")
+
+        for label_text, input_widget in [
+            ('💎 波币支付ID:', self.bobi_payment_input),
+            ('💲 USDT支付ID:', self.usdt_payment_input),
+            ('💸 波币提现ID:', self.bobi_cash_input),
+        ]:
+            row = QHBoxLayout()
+            row.addWidget(QLabel(label_text))
+            row.addWidget(input_widget)
+            payment_layout.addLayout(row)
+
+        # 添加保存提示按钮
+        save_hint = QLabel("提示：修改后请点击主界面的【保存配置】按钮生效")
+        payment_layout.addWidget(save_hint)
+
+        payment_group.setLayout(payment_layout)
+        tab2_layout.addWidget(payment_group)
+
+        # 添加弹性空间
+        tab2_layout.addStretch()
+
+        tab2.setLayout(tab2_layout)
+
+        # ===== 将两个标签页添加到tab组件 =====
+        tab_widget.addTab(tab1, "📊 操作中心")
+        tab_widget.addTab(tab2, "💰 支付配置")
+
+        # 将tab_widget添加到主布局
+        main_layout.addWidget(tab_widget)
+
+        # 设置主布局
+        self.setLayout(main_layout)
+        self.resize(700, 500)  # 稍微调高窗口高度
+
+        # ===== 事件绑定 =====
+        self.btn_save.clicked.connect(self.save_config)
+        self.btn_today.clicked.connect(self.today)
+        self.btn_yesterday.clicked.connect(self.yesterday)
+        self.btn_smart.clicked.connect(self.start_smart_mode)
+        self.btn_stop.clicked.connect(self.stop_smart_mode)
+
+        self.update_time()
+
+        self.clear_result_timer = QTimer()
+        self.clear_result_timer.setSingleShot(True)
+        self.clear_result_timer.timeout.connect(self.clear_result_label)
+
+    def _separator_line(self):
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setFrameShadow(QFrame.Sunken)
+        return line
+
+    def load_config(self):
+        if os.path.exists(CONFIG_FILE):
+            config = configparser.ConfigParser()
+            config.read(CONFIG_FILE)
+            if 'settings' in config:
+                self.port_input.setText(config['settings'].get('port', ''))
+                self.cookie_input.setText(config['settings'].get('cookie', ''))
+                self.code_input.setText(config['settings'].get('code', ''))
+                # 加载支付方式配置
+                self.bobi_payment_input.setText(config['settings'].get('bobi_payment_id', ''))
+                self.usdt_payment_input.setText(config['settings'].get('usdt_payment_id', ''))
+                self.bobi_cash_input.setText(config['settings'].get('bobi_cash_id', '10150'))  # 新增：波币提现ID，默认10150
+
+    def save_config(self):
+        port = self.port_input.text().strip()
+        cookie = self.cookie_input.text().strip()
+        code = self.code_input.text().strip()
+        bobi_payment = self.bobi_payment_input.text().strip()
+        usdt_payment = self.usdt_payment_input.text().strip()
+        bobi_cash = self.bobi_cash_input.text().strip()  # 新增：波币提现ID
+
+        if not port or not cookie or not code or not bobi_payment or not usdt_payment or not bobi_cash:
+            QMessageBox.warning(self, "提示",
+                                "请完整填写所有配置项（端口、Cookie、登录码、波币支付ID、USDT支付ID、波币提现ID）后再保存。")
+            return
+
+        # 验证支付ID是否为数字
+        try:
+            int(bobi_payment)
+            int(usdt_payment)
+            int(bobi_cash)
+        except ValueError:
+            QMessageBox.warning(self, "提示", "所有支付ID必须是数字！")
+            return
+
+        config = configparser.ConfigParser()
+        config['settings'] = {
+            'port': port,
+            'cookie': cookie,
+            'code': code,
+            'bobi_payment_id': bobi_payment,
+            'usdt_payment_id': usdt_payment,
+            'bobi_cash_id': bobi_cash  # 新增：波币提现ID
+        }
+
+        with open(CONFIG_FILE, 'w') as f:
+            config.write(f)
+
+        QMessageBox.information(self, "成功", "✅ 配置已保存")
+
+    def today(self):
+        self.run_task(self._run_today_data)
+
+    def yesterday(self):
+        self.run_task(self._run_yesterday_data)
+
+    def _run_today_data(self):
+        port = self.port_input.text()
+        cookie = self.cookie_input.text()
+        code = self.code_input.text()
+
+        # 获取支付方式ID并转换为整数
+        bobi_payment_id = int(self.bobi_payment_input.text())
+        usdt_payment_id = int(self.usdt_payment_input.text())
+        bobi_cash_id = int(self.bobi_cash_input.text())  # 新增：波币提现ID
+
+        dqsj = datetime.now()
+        qt = dqsj - timedelta(days=2)
+        zt = dqsj - timedelta(days=1)
+        mt = dqsj + timedelta(days=1)
+        qrld = qt.strftime('%Y-%m-%d 00:00:00')
+        zrld = zt.strftime('%Y-%m-%d 00:00:00')
+        jrld = dqsj.strftime('%Y-%m-%d 00:00:00')
+        mrld = mt.strftime('%Y-%m-%d 00:00:00')
+        gshqrld = int(datetime.strptime(qrld, "%Y-%m-%d %H:%M:%S").timestamp())
+        gshzrld = int(datetime.strptime(zrld, "%Y-%m-%d %H:%M:%S").timestamp())
+        gshjrld = int(datetime.strptime(jrld, "%Y-%m-%d %H:%M:%S").timestamp())
+        gshmrld = int(datetime.strptime(mrld, "%Y-%m-%d %H:%M:%S").timestamp())
+
+        headers = {
+            'Cookie': f'token={cookie}',
+        }
+
+        url = f"http://v.boinht.com:{port}/data_statistics/pf_list"  # 数据总表
+
+        data = {
+            "begin_time": gshjrld,
+            "end_time": gshmrld,
+            "index": 2,
+            "login_code": code,
+        }
+
+        在线 = 0
+
+        response = requests.post(url, data=data, headers=headers)
+        if response.status_code == 200:
+            data = response.json()['chunk_result']
+            zxrs = data.get('data')
+            在线 = zxrs.get('online_recharge')
+            print(f'在线:', 在线)
+            zcl = zxrs.get('reg_count_detail')
+            在线人数 = zxrs.get('online_user', 0)
+            绑定量 = zxrs.get('recharge_count', 0)
+            注册人数 = zcl.get('total_values', [0])
+            if 注册人数:
+                注册人数 = 注册人数[0]
+        else:
+            在线人数 = 0
+            注册人数 = 0
+
+        url = f"http://v.boinht.com:{port}/pp_service/pf_game_overview"  # 数据总表
+
+        data = {
+            "begin_time": gshjrld,
+            "end_time": gshmrld,
+            "index": 1,
+            "login_code": code,
+        }
+        总存款 = 0
+        总取款 = 0
+        取款人数 = 0
+        投注人数 = 0
+        总打码 = 0
+        首充金额 = 0
+        首充人数 = 0
+        后台赠送 = 0
+        后台扣款 = 0
+        美人桥 = 0
+        盈亏金额 = 0
+
+        response = requests.post(url, data=data, headers=headers)
+        if response.status_code == 200:
+            data = response.json()['result']
+            for dd in data:
+                总存款 = dd.get('recharge_money', 0)
+                总取款 = dd.get('cash_money', 0)
+                取款人数 = dd.get('cash_role', 0)
+                投注人 = dd.get('bet_role', 0)
+                投注人数 = int(投注人)
+                总打码 = dd.get('available_bet_sum', 0)
+                首充金额 = dd.get('first_recharge_money', 0)
+                首充人 = dd.get('first_recharge_role', 0)
+                首充人数 = int(首充人)
+                后台赠送 = dd.get('pf_recharge_add', 0)
+                后台扣款 = dd.get('pf_recharge_sub', 0)
+                美人桥 = dd.get('cs_recharge_money', 0)
+
+                投注 = dd.get('bet_sum')
+                投注额 = abs(投注)
+                中奖额 = dd.get('win_sum')
+                盈亏 = 投注额 - 中奖额
+                盈亏金额 = -abs(盈亏) if 盈亏 > 0 else abs(盈亏)
+
+        盈利 = (盈亏金额 / 总打码) * 100 if 总打码 != 0 else 0
+        盈利率 = f"{盈利:.2f}%"
+
+        总额 = 总存款 + 后台扣款
+        留存金额 = 总额 - 首充金额
+
+        url = f'http://v.boinht.com:{port}/payment_log/list_payment_log'  # 充值明细
+
+        data = {
+            "page_size": 999999,
+            "page": 1,
+            "channel_id": "",
+            "open_channel_id": "",
+            "is_pay": "1",
+            "send_item_time": "",
+            "begin_time": gshjrld,
+            "end_time": gshmrld,
+            "is_first_recharge": 0,
+            "payment_class_id": "",
+            "nickname": "",
+            "order_id": "",
+            "out_order_id": "",
+            "money_type": 1,
+            "oper_user": "",
+            "content": "",
+            "content2": "",
+            "content_list": "",
+            "min_money": "",
+            "max_money": "",
+            "login_code": code,
+        }
+
+        response = requests.post(url, headers=headers, data=data)
+        波币充值 = 0
+        USDT充值 = 0
+        三方 = 0
+        波币充值人数集合 = set()
+
+        if response.status_code == 200:
+            data = response.json()['result']
+
+            today = datetime.today().date()
+            print(f"当前统计日期: {today}")
+
+            for aa in data:
+                用户 = aa.get('user_id')
+                发货时间 = datetime.fromtimestamp(int(aa.get('send_item_time'))).date()
+
+                if 发货时间 == today:
+                    充值金额 = aa.get('money')
+                    支付方式 = aa.get('payment_class_id')
+
+                    # 使用配置的支付方式ID
+                    if 支付方式 == bobi_payment_id:  # 波币支付
+                        波币充值 += 充值金额
+                        波币充值人数集合.add(用户)
+
+                    elif 支付方式 == usdt_payment_id:  # USDT支付
+                        USDT充值 += 充值金额
+
+                    elif 支付方式 not in {777, 999}:  # 排除特殊方式
+                        三方 += 充值金额
+
+        波币充值人数 = len(波币充值人数集合)
+        print(f"今日波币充值人数: {波币充值人数}")
+        print(f"今日波币充值总额: {波币充值}")
+        print(f"今日USDT充值总额: {USDT充值}")
+        print(f"今日三方充值总额: {三方}")
+
+        url = f"http://v.boinht.com:{port}/pp_cash/pf_list"  # 提现管理
+
+        data = {
+            "status": "1",
+            "begin_time": gshqrld,
+            "end_time": gshmrld,
+            "send_status": "1",
+            "page": 1,
+            "page_size": 999999,
+            "is_manual": "0",
+            "cash_class_id": bobi_cash_id,  # 使用配置的波币提现ID
+            "login_code": code,
+        }
+
+        response = requests.post(url, data=data, headers=headers)
+        波币提现 = 0
+        if response.status_code == 200:
+            data = response.json()['result']
+
+            today = datetime.today().date()
+
+            for dd in data:
+                金额 = dd.get('money')
+                到账时间 = datetime.fromtimestamp(int(dd.get('send_time')))
+
+                if 到账时间.date() == today:
+                    波币提现 += 金额
+
+            print("今日波币提现总金额:", 波币提现)
+
+        银行卡 = 总取款 - 波币提现
+        倍数 = 总打码 / 总额 if 总额 != 0 else 0
+        充提差额 = 总额 - 总取款
+
+        url = f"http://v.boinht.com:{port}/payment_log/list_payment_log"  # 数据总表
+
+        data = {
+            'page_size': 99999,
+            'page': 1,
+            'is_pay': '1',
+            'send_item_time': '1',
+            'begin_time': gshjrld,
+            'end_time': gshmrld,
+            'is_first_recharge': 0,
+            'money_type': 1,
+            'min_money': '1',
+            'max_money': '1111111',
+            "login_code": code,
+        }
+        充值人数 = 0
+        rrsponse = requests.post(url, data=data, headers=headers)
+        if rrsponse.status_code == 200:
+            data = rrsponse.json()['result']
+            集合 = set()
+            for dd in data:
+                集合.add(dd.get('user_id'))
+            充值人数 = len(集合)
+
+        留存人数 = 充值人数 - 首充人数
+
+        url = f"http://v.boinht.com:{port}/payment_log/list_payment_log"  # 数据总表
+
+        data = {
+            "page_size": 600,
+            "page": 1,
+            "channel_id": "",
+            "open_channel_id": "",
+            "is_pay": "",
+            "send_item_time": "",
+            "begin_time": gshjrld,
+            "end_time": gshmrld,
+            "is_first_recharge": 0,
+            "payment_class_id": "",
+            "nickname": "",
+            "order_id": "",
+            "out_order_id": "",
+            "money_type": 1,
+            "oper_user": "fupogly",
+            "content": "",
+            "content2": "",
+            "content_list": "",
+            "min_money": "1",
+            "max_money": "11111111",
+            "login_code": code,
+        }
+
+        强制入款 = 0
+
+        response = requests.post(url, data=data, headers=headers)
+        if response.status_code == 200:
+            data = response.json()['result']
+
+            for dd in data:
+                if dd.get('item_name') != '后台充值':
+                    强制入款 += dd.get('money')
+
+        wb = Workbook()
+        ws = wb.active
+
+        ws.append(
+            ['在线人数', '注册人数', '充值人数', '出款人数', '投注人数', '总存款', '总取款', '留存金额', '留存人数',
+             '新增金额', '新增人数', 'USDT', '美人桥', '充值三方', '充值波币', '波币人数', '后台充值', '后台扣款',
+             '强制入款',
+             '银行卡',
+             '波币出款',
+             '总打码', '倍数', '盈利率', '盈亏金额', '充提差额', ])
+
+        ws.cell(row=2, column=1, value=在线人数)
+        ws.cell(row=2, column=2, value=注册人数)
+        ws.cell(row=2, column=3, value=充值人数)
+        ws.cell(row=2, column=4, value=取款人数)
+        ws.cell(row=2, column=5, value=投注人数)
+        ws.cell(row=2, column=6, value=总额)
+        ws.cell(row=2, column=7, value=总取款)
+        ws.cell(row=2, column=8, value=留存金额)
+        ws.cell(row=2, column=9, value=留存人数)
+        ws.cell(row=2, column=10, value=首充金额)
+        ws.cell(row=2, column=11, value=首充人数)
+        ws.cell(row=2, column=12, value=USDT充值)
+        ws.cell(row=2, column=13, value=美人桥)
+        ws.cell(row=2, column=14, value=三方)
+        ws.cell(row=2, column=15, value=波币充值)
+        ws.cell(row=2, column=16, value=波币充值人数)
+        ws.cell(row=2, column=17, value=后台赠送)
+        ws.cell(row=2, column=18, value=后台扣款)
+        ws.cell(row=2, column=19, value=强制入款)
+        ws.cell(row=2, column=20, value=银行卡)
+        ws.cell(row=2, column=21, value=波币提现)
+        ws.cell(row=2, column=22, value=总打码)
+        ws.cell(row=2, column=23, value=倍数)
+        ws.cell(row=2, column=24, value=盈利率)
+        ws.cell(row=2, column=25, value=盈亏金额)
+        ws.cell(row=2, column=26, value=充提差额)
+
+        当前时间 = datetime.now()
+        dq = 当前时间.strftime('%m月%d日%H时%M分%S秒')
+
+        wb.save(f'富婆今日数据_{dq}.xlsx')
+        os.startfile(f'富婆今日数据_{dq}.xlsx')
+
+    def _run_yesterday_data(self):
+        port = self.port_input.text()
+        cookie = self.cookie_input.text()
+        code = self.code_input.text()
+
+        # 获取支付方式ID并转换为整数
+        bobi_payment_id = int(self.bobi_payment_input.text())
+        usdt_payment_id = int(self.usdt_payment_input.text())
+        bobi_cash_id = int(self.bobi_cash_input.text())  # 新增：波币提现ID
+
+        dqsj = datetime.now()
+        qt = dqsj - timedelta(days=2)
+        zt = dqsj - timedelta(days=1)
+        mt = dqsj + timedelta(days=1)
+        qrld = qt.strftime('%Y-%m-%d 00:00:00')
+        zrld = zt.strftime('%Y-%m-%d 00:00:00')
+        jrld = dqsj.strftime('%Y-%m-%d 00:00:00')
+        mrld = mt.strftime('%Y-%m-%d 00:00:00')
+        gshqrld = int(datetime.strptime(qrld, "%Y-%m-%d %H:%M:%S").timestamp())
+        gshzrld = int(datetime.strptime(zrld, "%Y-%m-%d %H:%M:%S").timestamp())
+        gshjrld = int(datetime.strptime(jrld, "%Y-%m-%d %H:%M:%S").timestamp())
+        gshmrld = int(datetime.strptime(mrld, "%Y-%m-%d %H:%M:%S").timestamp())
+
+        headers = {
+            'Cookie': f'token={cookie}',
+        }
+        url = f"http://v.boinht.com:{port}/data_statistics/pf_list"  # 数据总表
+
+        data = {
+            "begin_time": gshzrld,
+            "end_time": gshjrld,
+            "index": 2,
+            "login_code": code,
+        }
+
+        在线 = 0
+
+        response = requests.post(url, data=data, headers=headers)
+        if response.status_code == 200:
+            data = response.json()['chunk_result']
+            zxrs = data.get('data')
+            在线 = zxrs.get('online_recharge')
+            print(f'在线:', 在线)
+            zcl = zxrs.get('reg_count_detail')
+            在线人数 = zxrs.get('online_user', 0)
+            绑定量 = zxrs.get('recharge_count', 0)
+            注册人数 = zcl.get('total_values', [0])
+            if 注册人数:
+                注册人数 = 注册人数[0]
+        else:
+            在线人数 = 0
+            注册人数 = 0
+
+        url = f"http://v.boinht.com:{port}/pp_service/pf_game_overview"  # 数据总表
+
+        data = {
+            "begin_time": gshzrld,
+            "end_time": gshjrld,
+            "index": 1,
+            "login_code": code,
+        }
+
+        总存款 = 0
+        总取款 = 0
+        取款人数 = 0
+        投注人数 = 0
+        总打码 = 0
+        首充金额 = 0
+        首充人数 = 0
+        后台赠送 = 0
+        后台扣款 = 0
+        美人桥 = 0
+        盈亏金额 = 0
+
+        response = requests.post(url, data=data, headers=headers)
+        if response.status_code == 200:
+            data = response.json()['result']
+            for dd in data:
+                总存款 = dd.get('recharge_money', 0)
+                总取款 = dd.get('cash_money', 0)
+                取款人数 = dd.get('cash_role', 0)
+                投注人 = dd.get('bet_role', 0)
+                投注人数 = int(投注人)
+                总打码 = dd.get('available_bet_sum', 0)
+                首充金额 = dd.get('first_recharge_money', 0)
+                首充人 = dd.get('first_recharge_role', 0)
+                首充人数 = int(首充人)
+                后台赠送 = dd.get('pf_recharge_add', 0)
+                后台扣款 = dd.get('pf_recharge_sub', 0)
+                美人桥 = dd.get('cs_recharge_money', 0)
+                投注 = dd.get('bet_sum')
+                投注额 = abs(投注)
+                中奖额 = dd.get('win_sum')
+                盈亏 = 投注额 - 中奖额
+                盈亏金额 = -abs(盈亏) if 盈亏 > 0 else abs(盈亏)
+
+        盈利 = (盈亏金额 / 总打码) * 100 if 总打码 != 0 else 0
+        盈利率 = f"{盈利:.2f}%"
+
+        总额 = 总存款 + 后台扣款
+        留存金额 = 总额 - 首充金额
+
+        url = f'http://v.boinht.com:{port}/payment_log/list_payment_log'  # 充值明细
+
+        data = {
+            "page_size": 999999,
+            "page": 1,
+            "channel_id": "",
+            "open_channel_id": "",
+            "is_pay": "1",
+            "send_item_time": "",
+            "begin_time": gshqrld,
+            "end_time": gshjrld,
+            "is_first_recharge": 0,
+            "payment_class_id": "",
+            "nickname": "",
+            "order_id": "",
+            "out_order_id": "",
+            "money_type": 1,
+            "oper_user": "",
+            "content": "",
+            "content2": "",
+            "content_list": "",
+            "min_money": "",
+            "max_money": "",
+            "login_code": code,
+        }
+
+        response = requests.post(url, headers=headers, data=data)
+        波币充值 = 0
+        三方 = 0
+        USDT充值 = 0
+        波币充值人数集合 = set()
+
+        if response.status_code == 200:
+            data = response.json()['result']
+
+            yesterday = zt.date()
+            print(f"当前统计日期: {yesterday}")
+
+            for aa in data:
+                用户 = aa.get('user_id')
+                发货时间 = datetime.fromtimestamp(int(aa.get('send_item_time'))).date()
+
+                if 发货时间 == yesterday:
+                    充值金额 = aa.get('money')
+                    支付方式 = aa.get('payment_class_id')
+
+                    # 使用配置的支付方式ID
+                    if 支付方式 == bobi_payment_id:  # 波币支付
+                        波币充值 += 充值金额
+                        波币充值人数集合.add(用户)
+
+                    elif 支付方式 == usdt_payment_id:  # USDT支付
+                        USDT充值 += 充值金额
+
+                    elif 支付方式 not in {777, 999}:  # 排除特殊方式
+                        三方 += 充值金额
+
+        波币充值人数 = len(波币充值人数集合)
+        print(f"昨日波币充值人数: {波币充值人数}")
+        print(f"昨日波币充值总额: {波币充值}")
+        print(f"昨日USDT充值总额: {USDT充值}")
+        print(f"昨日三方充值总额: {三方}")
+
+        url = f"http://v.boinht.com:{port}/pp_cash/pf_list"  # 波币提现
+
+        data = {
+            "status": "1",
+            "begin_time": gshqrld,
+            "end_time": gshjrld,
+            "send_status": "1",
+            "page": 1,
+            "page_size": 999999,
+            "is_manual": "0",
+            "cash_class_id": bobi_cash_id,  # 使用配置的波币提现ID
+            "login_code": code,
+        }
+
+        response = requests.post(url, data=data, headers=headers)
+        波币提现 = 0
+        if response.status_code == 200:
+            data = response.json()['result']
+
+            yesterday = zt.date()
+
+            for dd in data:
+                金额 = dd.get('money')
+                到账时间 = datetime.fromtimestamp(int(dd.get('send_time')))
+
+                if 到账时间.date() == yesterday:
+                    波币提现 += 金额
+
+            print("昨天波币提现总金额:", 波币提现)
+
+        银行卡 = 总取款 - 波币提现
+        倍数 = 总打码 / 总额 if 总额 != 0 else 0
+        充提差额 = 总额 - 总取款
+
+        url = f"http://v.boinht.com:{port}/payment_log/list_payment_log"  # 数据总表
+
+        data = {
+            'page_size': 99999,
+            'page': 1,
+            'is_pay': '1',
+            'send_item_time': '1',
+            'begin_time': gshzrld,
+            'end_time': gshjrld,
+            'is_first_recharge': 0,
+            'money_type': 1,
+            'min_money': '1',
+            'max_money': '1111111',
+            "login_code": code,
+        }
+        充值人数 = 0
+        rrsponse = requests.post(url, data=data, headers=headers)
+        if rrsponse.status_code == 200:
+            data = rrsponse.json()['result']
+
+            集合 = set()
+            for dd in data:
+                集合.add(dd.get('user_id'))
+            充值人数 = len(集合)
+
+        留存人数 = 充值人数 - 首充人数
+
+        url = f"http://v.boinht.com:{port}/payment_log/list_payment_log"  # 数据总表
+
+        data = {
+            "page_size": 600,
+            "page": 1,
+            "channel_id": "",
+            "open_channel_id": "",
+            "is_pay": "",
+            "send_item_time": "",
+            "begin_time": gshzrld,
+            "end_time": gshjrld,
+            "is_first_recharge": 0,
+            "payment_class_id": "",
+            "nickname": "",
+            "order_id": "",
+            "out_order_id": "",
+            "money_type": 1,
+            "oper_user": "fupogly",
+            "content": "",
+            "content2": "",
+            "content_list": "",
+            "min_money": "1",
+            "max_money": "11111111",
+            "login_code": code,
+        }
+
+        强制入款 = 0
+
+        response = requests.post(url, data=data, headers=headers)
+        if response.status_code == 200:
+            data = response.json()['result']
+
+            for dd in data:
+                if dd.get('item_name') != '后台充值':
+                    强制入款 += dd.get('money')
+
+        wb = Workbook()
+        ws = wb.active
+
+        ws.append(
+            ['在线人数', '注册人数', '充值人数', '出款人数', '投注人数', '总存款', '总取款', '留存金额', '留存人数',
+             '新增金额', '新增人数', 'USDT', '美人桥', '充值三方', '充值波币', '波币人数', '后台充值', '后台扣款',
+             '强制入款',
+             '银行卡',
+             '波币出款',
+             '总打码', '倍数', '盈利率', '盈亏金额', '充提差额', ])
+
+        ws.cell(row=2, column=1, value=在线人数)
+        ws.cell(row=2, column=2, value=注册人数)
+        ws.cell(row=2, column=3, value=充值人数)
+        ws.cell(row=2, column=4, value=取款人数)
+        ws.cell(row=2, column=5, value=投注人数)
+        ws.cell(row=2, column=6, value=总额)
+        ws.cell(row=2, column=7, value=总取款)
+        ws.cell(row=2, column=8, value=留存金额)
+        ws.cell(row=2, column=9, value=留存人数)
+        ws.cell(row=2, column=10, value=首充金额)
+        ws.cell(row=2, column=11, value=首充人数)
+        ws.cell(row=2, column=12, value=USDT充值)
+        ws.cell(row=2, column=13, value=美人桥)
+        ws.cell(row=2, column=14, value=三方)
+        ws.cell(row=2, column=15, value=波币充值)
+        ws.cell(row=2, column=16, value=波币充值人数)
+        ws.cell(row=2, column=17, value=后台赠送)
+        ws.cell(row=2, column=18, value=后台扣款)
+        ws.cell(row=2, column=19, value=强制入款)
+        ws.cell(row=2, column=20, value=银行卡)
+        ws.cell(row=2, column=21, value=波币提现)
+        ws.cell(row=2, column=22, value=总打码)
+        ws.cell(row=2, column=23, value=倍数)
+        ws.cell(row=2, column=24, value=盈利率)
+        ws.cell(row=2, column=25, value=盈亏金额)
+        ws.cell(row=2, column=26, value=充提差额)
+
+        当前时间 = datetime.now()
+        dq = 当前时间.strftime('%m月%d日%H时%M分%S秒')
+
+        wb.save(f'富婆昨日数据_{dq}.xlsx')
+        os.startfile(f'富婆昨日数据_{dq}.xlsx')
+
+    def run_task(self, task_func):
+        self.btn_today.setEnabled(False)
+        self.btn_yesterday.setEnabled(False)
+        self.thread = WorkerThread(task_func)
+        self.thread.finished.connect(self.task_finished)
+        self.thread.start()
+
+    def task_finished(self, result):
+        self.btn_today.setEnabled(True)
+        self.btn_yesterday.setEnabled(True)
+
+        if result == "success":
+            self.result_label.setText("✅ 任务已成功完成")
+            self.result_label.setStyleSheet("font-size: 14px; color: green; padding-left: 4px;")
+            self.clear_result_timer.start(10000)
+        elif result.startswith("error"):
+            # 提取错误信息（去掉开头的"error: "）
+            error_msg = result[6:] if result.startswith("error: ") else result
+
+            # 特殊错误信息转换
+            if "波币提现" in error_msg:
+                display_msg = "请检查Cookie或登录码是否正确"
+                # 弹窗提示
+                QMessageBox.warning(self, "认证错误", "Cookie或登录码无效，请检查后重试")
+            elif "login_code 校验失败" in error_msg:
+                display_msg = "登录码错误，请检查"
+                QMessageBox.warning(self, "配置错误", "登录码校验失败，请检查登录码是否正确")
+            elif "设备登陆中" in error_msg:
+                display_msg = "Cookie无效或已过期"
+                QMessageBox.warning(self, "配置错误", "设备登陆中，请检查Cookie是否有效")
+            elif "连接服务器失败" in error_msg:
+                display_msg = error_msg
+                QMessageBox.warning(self, "网络错误", error_msg)
+            else:
+                display_msg = error_msg
+
+            self.result_label.setText(f"❌ {display_msg}")
+            print(f"任务失败: {result}")  # 控制台仍然打印完整错误信息用于调试
+            self.result_label.setStyleSheet("font-size: 14px; color: red; padding-left: 4px;")
+            self.clear_result_timer.start(10000)
+
+    def clear_result_label(self):
+        self.result_label.setText("")
+
+    def start_smart_mode(self):
+        if self.smart_mode_active:
+            QMessageBox.information(self, "提示", "智能模式已经运行中 ✅")
+            return
+        self.timer.start(1000)
+        self.last_run_hour = -1
+        self.smart_mode_active = True
+        self.status_label.setText("当前状态：智能模式运行中 ✅")
+        self.status_label.setStyleSheet("font-size: 14px; color: green;")
+        QMessageBox.information(self, "智能模式", "已启动，每小时 01:05 自动运行今日数据")
+
+    def stop_smart_mode(self):
+        if not self.smart_mode_active:
+            QMessageBox.information(self, "提示", "智能模式尚未启动")
+            return
+        self.timer.stop()
+        self.smart_mode_active = False
+        self.status_label.setText("当前状态：未开启智能模式 ⛔")
+        self.status_label.setStyleSheet("font-size: 14px; color: red;")
+        QMessageBox.information(self, "智能模式", "已停止")
+
+    def smart_mode_check(self):
+        now = QTime.currentTime()
+        current_hour = QDateTime.currentDateTime().time().hour()
+        if now.minute() == 1 and now.second() == 5:
+            if self.last_run_hour != current_hour:
+                print(f"[智能模式] 触发任务：{QDateTime.currentDateTime().toString()}")
+                self.today()
+                self.last_run_hour = current_hour
+
+    def update_time(self):
+        now = QDateTime.currentDateTime()
+        self.time_label.setText(f"当前时间：{now.toString('yyyy-MM-dd HH:mm:ss')}")
+
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    window = DataApp()
+    window.show()
+    sys.exit(app.exec_())
