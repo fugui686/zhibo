@@ -643,10 +643,10 @@ class DataApp(QWidget):
         ws.cell(row=2, column=26, value=充提差额)
 
         当前时间 = datetime.now()
-        dq = 当前时间.strftime('%m月%d日%H时%M分%S秒')
+        dq = 当前时间.strftime('%m%d_%H%M%S')
 
-        wb.save(f'富婆今日数据_{dq}.xlsx')
-        os.startfile(f'富婆今日数据_{dq}.xlsx')
+        wb.save(f'今日每小时数据_{dq}.xlsx')
+        os.startfile(f'今日每小时数据_{dq}.xlsx')
 
     def _run_yesterday_data(self):
         port = self.port_input.text()
@@ -949,10 +949,10 @@ class DataApp(QWidget):
         ws.cell(row=2, column=26, value=充提差额)
 
         当前时间 = datetime.now()
-        dq = 当前时间.strftime('%m月%d日%H时%M分%S秒')
+        dq = 当前时间.strftime('%m%d_%H%M%S')
 
-        wb.save(f'富婆昨日数据_{dq}.xlsx')
-        os.startfile(f'富婆昨日数据_{dq}.xlsx')
+        wb.save(f'昨日每小时数据_{dq}.xlsx')
+        os.startfile(f'昨日每小时数据_{dq}.xlsx')
 
     def run_task(self, task_func):
         self.btn_today.setEnabled(False)
